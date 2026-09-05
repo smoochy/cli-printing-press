@@ -1,5 +1,13 @@
 # Changelog
 
+## [4.31.8](https://github.com/mvanhorn/cli-printing-press/compare/v4.31.7...v4.31.8) (2026-09-05)
+
+
+### Bug Fixes
+
+* **cli:** kebab-case auto-synthesized command examples ([#4558](https://github.com/mvanhorn/cli-printing-press/issues/4558)) ([6f52212](https://github.com/mvanhorn/cli-printing-press/commit/6f52212b1a349b51882a7a67768a7dff5778b637))
+* **cli:** stop analytics group-by emitting Go nil string ([#4559](https://github.com/mvanhorn/cli-printing-press/issues/4559)) ([36b8063](https://github.com/mvanhorn/cli-printing-press/commit/36b8063069d6d1a133e9ad6f9669894a7dc5fe51))
+
 ## [4.31.7](https://github.com/mvanhorn/cli-printing-press/compare/v4.31.6...v4.31.7) (2026-09-04)
 
 
