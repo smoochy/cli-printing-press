@@ -55,12 +55,13 @@ func newVerifyCmdWithOptions(opts verifyCmdOptions) *cobra.Command {
 (read-only GETs) or a spec-derived mock server. Produces a PASS/WARN/FAIL
 verdict with per-command scores and a data pipeline integrity check.
 
-If --api-key is provided, tests run against the real API (read-only only).
+If --api-key is provided, or --env-var names a non-empty environment variable,
+tests run against the real API (read-only only).
 Otherwise, a mock server is started from the OpenAPI spec.
 
 Use --fix to auto-patch common failures and re-test (max 3 iterations).`,
 		Example: `  # Test against real API (read-only GETs only)
-  cli-printing-press verify --dir ./github-pp-cli --spec /tmp/spec.json --api-key $GITHUB_TOKEN
+  cli-printing-press verify --dir ./github-pp-cli --spec /tmp/spec.json --env-var GITHUB_TOKEN
 
   # Test against mock server (no API key needed)
   cli-printing-press verify --dir ./github-pp-cli --spec /tmp/spec.json
@@ -100,7 +101,8 @@ Use --fix to auto-patch common failures and re-test (max 3 iterations).`,
 			// Run fix loop if requested and score is below threshold
 			var fixReport *pipeline.FixLoopReport
 			if fix && shouldRunFixLoop(report) {
-				fmt.Printf("\nVerification verdict %s (pass rate %.0f%%, threshold %d%%). Running fix loop (max %d iterations)...\n\n",
+				// Progress belongs on stderr so --json stdout stays a single JSON value.
+				fmt.Fprintf(os.Stderr, "\nVerification verdict %s (pass rate %.0f%%, threshold %d%%). Running fix loop (max %d iterations)...\n\n",
 					report.Verdict, report.PassRate, threshold, maxIterations)
 				fixReport, err = opts.runFixLoop(cfg, report, maxIterations)
 				if err != nil {
@@ -153,7 +155,7 @@ Use --fix to auto-patch common failures and re-test (max 3 iterations).`,
 	cmd.Flags().StringVar(&dir, "dir", "", "Path to the generated CLI directory (required)")
 	cmd.Flags().StringVar(&specPath, "spec", "", "Path to the OpenAPI spec file")
 	cmd.Flags().StringVar(&apiKey, "api-key", "", "API key for live testing (read-only GETs only)")
-	cmd.Flags().StringVar(&envVar, "env-var", "", "Environment variable name for the API key (e.g., GITHUB_TOKEN)")
+	cmd.Flags().StringVar(&envVar, "env-var", "", "Environment variable whose nonempty value selects live testing (e.g., GITHUB_TOKEN)")
 	cmd.Flags().IntVar(&threshold, "threshold", 80, "Minimum pass rate percentage")
 	cmd.Flags().BoolVar(&fix, "fix", false, "Auto-fix common failures and re-test")
 	cmd.Flags().IntVar(&maxIterations, "max-iterations", 3, "Maximum fix loop iterations")
@@ -187,6 +189,9 @@ func shouldRunFixLoop(report *pipeline.VerifyReport) bool {
 func printVerifyReport(report *pipeline.VerifyReport) {
 	fmt.Printf("Runtime Verification: %s\n", report.Binary)
 	fmt.Printf("Mode: %s\n\n", report.Mode)
+	if report.ModeDetail != "" {
+		fmt.Printf("%s\n\n", report.ModeDetail)
+	}
 
 	// Per-command results
 	fmt.Printf("%-30s %-12s %-6s %-8s %-8s %s\n", "COMMAND", "KIND", "HELP", "DRY-RUN", "EXEC", "SCORE")
