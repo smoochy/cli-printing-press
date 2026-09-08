@@ -676,10 +676,13 @@ func TestGenerateFreshnessHelperEmitted(t *testing.T) {
 		assert.Contains(t, src, snippet, "auto_refresh.go missing %q", snippet)
 	}
 	optOutIndex := strings.Index(src, "env_opt_out")
+	openROIndex := strings.Index(src, "store.OpenReadOnlyContext(ctx, dbPath)")
 	openStoreIndex := strings.Index(src, "store.OpenWithContext(ctx, dbPath)")
 	require.NotEqual(t, -1, optOutIndex, "auto_refresh.go must report env opt-out")
+	require.NotEqual(t, -1, openROIndex, "auto_refresh.go must probe the store read-only before migrating")
 	require.NotEqual(t, -1, openStoreIndex, "auto_refresh.go must open the store after opt-out checks")
-	assert.Less(t, optOutIndex, openStoreIndex, "env opt-out must be checked before opening/migrating the store")
+	assert.Less(t, optOutIndex, openROIndex, "env opt-out must be checked before opening/migrating the store")
+	assert.Less(t, openROIndex, openStoreIndex, "freshness check must use OpenReadOnly before a write-open for refresh")
 
 	// auto_refresh_test.go covers the structured cache_warning emitter so a
 	// Go syntax error in auto_refresh_test.go.tmpl is caught at generation
@@ -1390,7 +1393,7 @@ func TestGenerateComposedApiKeyPlusBearerEmitsAdditionalHeader(t *testing.T) {
 	configSrc := string(configBytes)
 	assert.Regexp(t, `StAppKey\s+string`, configSrc,
 		"Config struct must carry a field for the sibling apiKey env var")
-	assert.Contains(t, configSrc, `os.Getenv("ST_APP_KEY")`,
+	assert.Contains(t, configSrc, `cliutil.EnvOverride("ST_APP_KEY")`,
 		"Load() must read ST_APP_KEY from env")
 	assert.Contains(t, configSrc, `cfg.StAppKey = v`,
 		"Load() must assign ST_APP_KEY into the Config field")
@@ -1484,7 +1487,7 @@ paths:
 	require.NoError(t, err)
 	configSrc := string(configBytes)
 	assert.Regexp(t, `DispatchStAppKey\s+string`, configSrc)
-	assert.Contains(t, configSrc, `os.Getenv("DISPATCH_ST_APP_KEY")`)
+	assert.Contains(t, configSrc, `cliutil.EnvOverride("DISPATCH_ST_APP_KEY")`)
 	assert.Contains(t, configSrc, `cfg.DispatchStAppKey = v`)
 
 	clientBytes, err := os.ReadFile(filepath.Join(outputDir, "internal", "client", "client.go"))
@@ -1543,7 +1546,7 @@ paths:
 	configSrc := string(configBytes)
 	assert.Regexp(t, `TrelloToken\s+string`, configSrc,
 		"Config struct must carry a field for the sibling query apiKey env var")
-	assert.Contains(t, configSrc, `os.Getenv("TRELLO_TOKEN")`,
+	assert.Contains(t, configSrc, `cliutil.EnvOverride("TRELLO_TOKEN")`,
 		"Load() must read TRELLO_TOKEN from env")
 	assert.Contains(t, configSrc, `cfg.TrelloToken = v`,
 		"Load() must assign TRELLO_TOKEN into the Config field")
@@ -4413,10 +4416,20 @@ func TestGenerateStoreDSNUsesImmediateTransactionsAndProfileJournalMode(t *testi
 				"read-write DSN must acquire immediate transactions and select the profile journal mode")
 			assert.NotContains(t, codeOnly, "_pragma=journal_mode("+tc.otherMode+")&_pragma=synchronous",
 				"read-write DSN must not emit the other profile journal mode")
-			assert.Contains(t, codeOnly, `?mode=ro&immutable=1&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)&_pragma=temp_store(MEMORY)&_pragma=mmap_size(0)`,
-				"read-only DSN must skip the WAL-index mmap while keeping mmap_size(0)")
+			if tc.cache {
+				assert.Contains(t, codeOnly, `?mode=ro&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)&_pragma=temp_store(MEMORY)&_pragma=mmap_size(0)`,
+					"rollback-journal read-only DSN must take SHARED locks (no immutable=1)")
+				assert.NotContains(t, codeOnly, `?mode=ro&immutable=1&_pragma=busy_timeout(5000)`,
+					"rollback-journal read-only DSN must not set immutable=1")
+				assert.Contains(t, codeOnly, `?mode=ro&_pragma=busy_timeout(1000)&_pragma=mmap_size(0)`,
+					"schema preflight probe must take SHARED locks on a rollback journal")
+			} else {
+				assert.Contains(t, codeOnly, `?mode=ro&immutable=1&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)&_pragma=temp_store(MEMORY)&_pragma=mmap_size(0)`,
+					"WAL read-only DSN must skip the WAL-index mmap while keeping mmap_size(0)")
+			}
 			requireGeneratedCompiles(t, outputDir)
-			runGoCommandRequired(t, outputDir, "test", "./internal/store", "-run", "^Test(OpenHardensSQLiteFilePermissions|HardenSQLiteFilesSkipsSymlinkSidecars|OpenAppliesPragmas|OpenReadOnly_SkipsWALIndexSidecars|OpenReadOnly_ConcurrentProcesses)$", "-count=1")
+			runName := "^Test(OpenHardensSQLiteFilePermissions|HardenSQLiteFilesSkipsSymlinkSidecars|OpenAppliesPragmas|OpenReadOnly_SkipsWALIndexSidecars|OpenReadOnly_ConcurrentProcesses|OpenReadOnly_RollbackJournalNoTornRead|ListScanStopsEarly|TypedNewestFirstOrder)$"
+			runGoCommandRequired(t, outputDir, "test", "./internal/store", "-run", runName, "-count=1")
 		})
 	}
 }
@@ -12604,7 +12617,9 @@ func TestGenerate_CookieAuthUsesBrowserTemplate(t *testing.T) {
 	assert.Contains(t, content, "strings.TrimSpace(name)")
 	assert.Contains(t, content, "RequiredCookieCount int")
 	assert.Contains(t, content, "discoverChromeProfiles(domain, requiredCookies)")
-	assert.Contains(t, content, "SELECT DISTINCT name FROM cookies WHERE host_key LIKE")
+	assert.Contains(t, content, "SELECT host_key, name FROM cookies")
+	assert.Contains(t, content, "cookieDomainMatches(hostKey, domain)")
+	assert.NotContains(t, content, "host_key LIKE")
 	assert.Contains(t, content, "is missing required cookies")
 	assert.Contains(t, content, "required cookies present")
 	assert.Contains(t, content, "--url")
@@ -12970,7 +12985,7 @@ func TestGenerateUserAgentEnvVarOverridesDefault(t *testing.T) {
 
 	clientSrc := readGeneratedFile(t, outputDir, "internal", "client", "client.go")
 	assert.Contains(t, clientSrc, `if req.Header.Get("User-Agent") == "" {`)
-	assert.Contains(t, clientSrc, `if ua := os.Getenv("UAENV_USER_AGENT"); ua != "" {`)
+	assert.Contains(t, clientSrc, `if ua := cliutil.EnvOverride("UAENV_USER_AGENT"); ua != "" {`)
 	assert.Contains(t, clientSrc, `req.Header.Set("User-Agent", ua)`)
 	assert.Contains(t, clientSrc, `req.Header.Set("User-Agent", "uaenv-pp-cli/0.1.0")`)
 	requireGeneratedCompiles(t, outputDir)
@@ -13222,7 +13237,13 @@ func TestGenerate_ComposedAuthUsesBrowserTemplate(t *testing.T) {
 	assert.Contains(t, content, `raw := []string{"customerId", "authToken"}`)
 	assert.Contains(t, content, "RequiredCookieCount")
 	assert.Contains(t, content, "profiles[i].RequiredCookieCount > profiles[j].RequiredCookieCount")
-	assert.Contains(t, content, "SELECT DISTINCT name FROM cookies WHERE host_key LIKE")
+	assert.Contains(t, content, "SELECT host_key, name FROM cookies")
+	assert.Contains(t, content, "cookieDomainMatches(hostKey, domain)")
+	assert.Contains(t, content, "decodeCookieValue")
+	assert.Contains(t, content, "cookieNameLooksCSRF")
+	assert.Contains(t, content, `"skip-validation"`)
+	assert.Contains(t, content, "validateComposedAuthProbe(composed, validationCookies, !skipValidation)")
+	assert.NotContains(t, content, "host_key LIKE")
 	assert.Contains(t, content, "printMissingCookieHint")
 	assert.Contains(t, content, "required cookies present")
 	assert.NotContains(t, content, "case 0:")
@@ -17665,9 +17686,9 @@ func TestGenerateEndpointTemplateVarsRuntimeSubstitution(t *testing.T) {
 	configGo := string(configGoBytes)
 	assert.Contains(t, configGo, "TemplateVars map[string]string",
 		"config struct must carry the TemplateVars map")
-	assert.Contains(t, configGo, `os.Getenv("SHOPIFY_SHOP")`,
+	assert.Contains(t, configGo, `cliutil.EnvOverride("SHOPIFY_SHOP")`,
 		"config Load() must read SHOPIFY_SHOP from env")
-	assert.Contains(t, configGo, `os.Getenv("SHOPIFY_API_VERSION")`,
+	assert.Contains(t, configGo, `cliutil.EnvOverride("SHOPIFY_API_VERSION")`,
 		"config Load() must read SHOPIFY_API_VERSION from env (spec var name 'api_version')")
 
 	// client.go must route requests through buildURL, not the old c.BaseURL+path concat.
@@ -19703,6 +19724,10 @@ func TestGenerateMCPIntentsEmittedWhenDeclared(t *testing.T) {
 	}
 	assert.Contains(t, body, `path = strings.ReplaceAll(path, placeholder, mcpPathValue(v))`,
 		"intent path params must use the shared MCP path-value helper")
+	assert.Contains(t, body, `mcplib.WithReadOnlyHintAnnotation(true)`,
+		"GET-only intents must advertise read-only tool annotations")
+	assert.NotContains(t, body, "then do nothing",
+		"intent descriptions must not keep unimplemented trailing clauses")
 
 	toolsPath := filepath.Join(outputDir, "internal", "mcp", "tools.go")
 	toolsData, err := os.ReadFile(toolsPath)
@@ -21424,9 +21449,9 @@ func TestGenerateEndpointTemplateEnvOverridesWireThrough(t *testing.T) {
 
 	configGo, err := os.ReadFile(filepath.Join(outputDir, "internal", "config", "config.go"))
 	require.NoError(t, err)
-	assert.Contains(t, string(configGo), `os.Getenv("ST_TENANT_ID")`,
+	assert.Contains(t, string(configGo), `cliutil.EnvOverride("ST_TENANT_ID")`,
 		"config Load() must read the override env var name")
-	assert.NotContains(t, string(configGo), `os.Getenv("SERVICETITAN_CRM_TENANT")`,
+	assert.NotContains(t, string(configGo), `cliutil.EnvOverride("SERVICETITAN_CRM_TENANT")`,
 		"the default env var name must not appear when an override exists")
 
 	syncGo, err := os.ReadFile(filepath.Join(outputDir, "internal", "cli", "sync.go"))
@@ -21527,12 +21552,12 @@ x-path-template-env-vars:
 	configGo, err := os.ReadFile(filepath.Join(outputDir, "internal", "config", "config.go"))
 	require.NoError(t, err)
 	configSrc := string(configGo)
-	assert.Contains(t, configSrc, `os.Getenv("ROOT_TENANT_ID")`,
+	assert.Contains(t, configSrc, `cliutil.EnvOverride("ROOT_TENANT_ID")`,
 		"config Load() must read the root-declared tenant env var")
-	assert.Contains(t, configSrc, `os.Getenv("ROOT_WORKSPACE")`,
+	assert.Contains(t, configSrc, `cliutil.EnvOverride("ROOT_WORKSPACE")`,
 		"config Load() must read the root-declared workspace env var")
-	assert.NotContains(t, configSrc, `os.Getenv("INFO_TENANT_ID")`)
-	assert.NotContains(t, configSrc, `os.Getenv("INFO_WORKSPACE")`)
+	assert.NotContains(t, configSrc, `cliutil.EnvOverride("INFO_TENANT_ID")`)
+	assert.NotContains(t, configSrc, `cliutil.EnvOverride("INFO_WORKSPACE")`)
 
 	syncGo, err := os.ReadFile(filepath.Join(outputDir, "internal", "cli", "sync.go"))
 	require.NoError(t, err)

@@ -162,7 +162,7 @@ func Load(configPath string) (*Config, error) {
 	cfg.snapshotFileConfig()
 
 	// Env var overrides
-	if v := os.Getenv("PRINTING_PRESS_GOLDEN_API_KEY"); v != "" {
+	if v := cliutil.EnvOverride("PRINTING_PRESS_GOLDEN_API_KEY"); v != "" {
 		cfg.PrintingPressGoldenApiKey = v
 		cfg.markEnvOverride("PrintingPressGoldenApiKey")
 		cfg.AuthSource = "env:PRINTING_PRESS_GOLDEN_API_KEY"
@@ -207,7 +207,7 @@ func Load(configPath string) (*Config, error) {
 	}
 
 	// Base URL override (used by printing-press verify to point at mock/test servers)
-	if v := os.Getenv("PRINTING_PRESS_GOLDEN_BASE_URL"); v != "" {
+	if v := cliutil.EnvOverride("PRINTING_PRESS_GOLDEN_BASE_URL"); v != "" {
 		cfg.BaseURL = v
 	}
 	return cfg, nil
@@ -343,19 +343,6 @@ func (c *Config) CredentialConfigured() bool {
 		return false
 	}
 	return c.AuthHeader() != ""
-}
-
-func applyAuthFormat(format string, replacements map[string]string) string {
-	if format == "" {
-		return ""
-	}
-	for key, value := range replacements {
-		format = strings.ReplaceAll(format, "{"+key+"}", value)
-	}
-	if strings.Contains(format, "{") {
-		return ""
-	}
-	return format
 }
 
 func (c *Config) AgentcookieManagedByExternalStore() bool {

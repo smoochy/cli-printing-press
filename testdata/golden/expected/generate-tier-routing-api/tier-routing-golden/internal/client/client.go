@@ -20,6 +20,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -245,14 +246,25 @@ func (c *Client) authForRequest(ctx context.Context) (requestAuth, error) {
 	}
 }
 
+var authFormatPlaceholderRe = regexp.MustCompile(`\{[A-Za-z0-9_]+\}`)
+
 func applyTierAuthFormat(format string, replacements map[string]string) string {
-	for key, value := range replacements {
-		format = strings.ReplaceAll(format, "{"+key+"}", value)
-	}
-	if strings.Contains(format, "{") {
+	if format == "" {
 		return ""
 	}
-	return format
+	unresolved := false
+	out := authFormatPlaceholderRe.ReplaceAllStringFunc(format, func(match string) string {
+		value, ok := replacements[match[1:len(match)-1]]
+		if !ok {
+			unresolved = true
+			return match
+		}
+		return value
+	})
+	if unresolved {
+		return ""
+	}
+	return out
 }
 
 // APIError carries HTTP status information for structured exit codes.
@@ -1254,7 +1266,7 @@ func (c *Client) doInternal(ctx context.Context, method, path string, params map
 			req.Header.Del(HTMLResponseHeader)
 		}
 		if req.Header.Get("User-Agent") == "" {
-			if ua := os.Getenv("TIER_ROUTING_GOLDEN_USER_AGENT"); ua != "" {
+			if ua := cliutil.EnvOverride("TIER_ROUTING_GOLDEN_USER_AGENT"); ua != "" {
 				req.Header.Set("User-Agent", ua)
 			} else {
 				req.Header.Set("User-Agent", "tier-routing-golden-pp-cli/1.0.0")

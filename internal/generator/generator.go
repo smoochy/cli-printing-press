@@ -402,30 +402,35 @@ func New(s *spec.APISpec, outputDir string) *Generator {
 			e, _ := lookupEndpointForTemplate(api, ref)
 			return e
 		},
-		"effectiveEndpointPath":       effectiveEndpointPath,
-		"effectiveSubEndpointPath":    effectiveSubEndpointPath,
-		"enumLiteral":                 enumLiteral,
-		"enumDescriptionHint":         enumDescriptionHint,
-		"jsonStringParam":             isJSONStringParam,
-		"jsonEnumSuggestion":          jsonEnumSuggestion,
-		"bodyMap":                     bodyMap,
-		"bodyMapForEndpoint":          bodyMapForEndpoint,
-		"bodyMapForEndpointVars":      bodyMapForEndpointVars,
-		"assignJSONBodyMap":           assignJSONBodyMap,
-		"declareJSONBodyMap":          declareJSONBodyMap,
-		"bodyVarDecls":                bodyVarDecls,
-		"bodyFlagRegs":                bodyFlagRegs,
-		"bodyRequiredChecks":          bodyRequiredChecks,
-		"bodyExceedsFlagDepth":        bodyExceedsFlagDepth,
-		"bodyHasStringBackedBool":     bodyHasStringBackedBool,
-		"multipartBodyMaps":           multipartBodyMaps,
-		"endpointUsesMultipart":       endpointUsesMultipart,
-		"endpointUsesRawRequest":      endpointUsesRawRequest,
-		"endpointUsesCSVArray":        endpointUsesCSVArray,
-		"endpointHasQueryFlags":       endpointHasQueryFlags,
-		"endpointHasRequestParams":    endpointHasRequestParams,
-		"endpointHasRequiredInput":    endpointHasRequiredInput,
-		"endpointSkipsErrorPathProbe": endpointSkipsErrorPathProbe,
+		"intentIsReadOnly":             intentIsReadOnly,
+		"intentIsDestructive":          intentIsDestructive,
+		"composeIntentToolDescription": composeIntentToolDescription,
+		"intentParamsForEmit":          intentParamsForEmit,
+		"intentParamDefaultGo":         intentParamDefaultGo,
+		"effectiveEndpointPath":        effectiveEndpointPath,
+		"effectiveSubEndpointPath":     effectiveSubEndpointPath,
+		"enumLiteral":                  enumLiteral,
+		"enumDescriptionHint":          enumDescriptionHint,
+		"jsonStringParam":              isJSONStringParam,
+		"jsonEnumSuggestion":           jsonEnumSuggestion,
+		"bodyMap":                      bodyMap,
+		"bodyMapForEndpoint":           bodyMapForEndpoint,
+		"bodyMapForEndpointVars":       bodyMapForEndpointVars,
+		"assignJSONBodyMap":            assignJSONBodyMap,
+		"declareJSONBodyMap":           declareJSONBodyMap,
+		"bodyVarDecls":                 bodyVarDecls,
+		"bodyFlagRegs":                 bodyFlagRegs,
+		"bodyRequiredChecks":           bodyRequiredChecks,
+		"bodyExceedsFlagDepth":         bodyExceedsFlagDepth,
+		"bodyHasStringBackedBool":      bodyHasStringBackedBool,
+		"multipartBodyMaps":            multipartBodyMaps,
+		"endpointUsesMultipart":        endpointUsesMultipart,
+		"endpointUsesRawRequest":       endpointUsesRawRequest,
+		"endpointUsesCSVArray":         endpointUsesCSVArray,
+		"endpointHasQueryFlags":        endpointHasQueryFlags,
+		"endpointHasRequestParams":     endpointHasRequestParams,
+		"endpointHasRequiredInput":     endpointHasRequiredInput,
+		"endpointSkipsErrorPathProbe":  endpointSkipsErrorPathProbe,
 		"endpointIsReadCommand": func(endpoint spec.Endpoint, opName string) bool {
 			return endpointIsReadCommandShared(endpoint, opName, sharedGETRPCPaths(g.Spec.Resources))
 		},
@@ -466,6 +471,7 @@ func New(s *spec.APISpec, outputDir string) *Generator {
 		"globalScopeParams":         globalScopeParams,
 		"responsePathCases":         responsePathCases,
 		"syncParamDefaultCases":     syncParamDefaultCases,
+		"syncRequiredQueryCases":    syncRequiredQueryCases,
 		"syncHiddenHistoryCases":    syncHiddenHistoryCases,
 		"envName":                   naming.EnvPrefix,
 		// endpointTemplateEnvName resolves the env-var name for a
@@ -986,6 +992,7 @@ func isMutationMethod(method string) bool {
 type helpersTemplateData struct {
 	*spec.APISpec
 	HelperFlags
+	HasAuthCommand bool
 }
 
 // doctorTemplateData wraps APISpec with flags for store-aware credential
@@ -2850,8 +2857,9 @@ func (g *Generator) renderSingleFiles() error {
 			hFlags.HasSyncHelpers = g.hasGeneratedSyncImplementation()
 			hFlags.HasResponseUnwrap = g.hasDataLayer() && promotedCommandsCanUnwrapResponse(g.PromotedCommands, g.Spec.Types)
 			data = &helpersTemplateData{
-				APISpec:     g.Spec,
-				HelperFlags: hFlags,
+				APISpec:        g.Spec,
+				HelperFlags:    hFlags,
+				HasAuthCommand: g.shouldEmitAuth(),
 			}
 		case "root_test.go.tmpl":
 			data = &rootTestTemplateData{
@@ -3045,12 +3053,14 @@ func (g *Generator) renderOptionalSupportFiles() error {
 	if g.hasAutoRefresh() {
 		autoRefreshData := struct {
 			*spec.APISpec
-			SyncableResources []profiler.SyncableResource
-			Pagination        profiler.PaginationProfile
+			SyncableResources      []profiler.SyncableResource
+			DependentSyncResources []profiler.DependentResource
+			Pagination             profiler.PaginationProfile
 		}{
-			APISpec:           g.Spec,
-			SyncableResources: g.profile.SyncableResources,
-			Pagination:        g.profile.Pagination,
+			APISpec:                g.Spec,
+			SyncableResources:      g.profile.SyncableResources,
+			DependentSyncResources: g.profile.DependentSyncResources,
+			Pagination:             g.profile.Pagination,
 		}
 		if err := g.renderTemplate("auto_refresh.go.tmpl", filepath.Join("internal", "cli", "auto_refresh.go"), autoRefreshData); err != nil {
 			return fmt.Errorf("rendering auto_refresh: %w", err)
@@ -6768,6 +6778,33 @@ func syncParamDefaultCases(syncable []profiler.SyncableResource, dependents []pr
 	}
 	for _, dependent := range dependents {
 		add(dependent.Name, dependent.QueryParamDefaults)
+	}
+	return out
+}
+
+type syncRequiredQueryCase struct {
+	Resource string
+	Params   []string
+}
+
+func syncRequiredQueryCases(syncable []profiler.SyncableResource, dependents []profiler.DependentResource) []syncRequiredQueryCase {
+	seen := map[string]struct{}{}
+	var out []syncRequiredQueryCase
+	add := func(name string, params []string) {
+		if len(params) == 0 {
+			return
+		}
+		if _, dup := seen[name]; dup {
+			return
+		}
+		seen[name] = struct{}{}
+		out = append(out, syncRequiredQueryCase{Resource: name, Params: params})
+	}
+	for _, resource := range syncable {
+		add(resource.Name, resource.RequiredQueryParams)
+	}
+	for _, dependent := range dependents {
+		add(dependent.Name, dependent.RequiredQueryParams)
 	}
 	return out
 }
