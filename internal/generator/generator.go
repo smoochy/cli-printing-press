@@ -377,6 +377,8 @@ func New(s *spec.APISpec, outputDir string) *Generator {
 			}
 			return naming.CLI(s.Name)
 		},
+		"cliName":            naming.CLI,
+		"mcpName":            naming.MCP,
 		"goDirectiveVersion": resolveCurrentGoDirectiveVersion,
 		"goToolchainVersion": resolveCurrentGoToolchainVersion,
 		"graphqlQueryField":  graphqlQueryField,
@@ -1111,6 +1113,9 @@ type readmeTemplateData struct {
 	// that was promoted (e.g. "qr" → "get-qrcode"). Currently informational —
 	// templates that need to surface the underlying operation-id can read it.
 	PromotedEndpointNames map[string]string
+	// WhichIndex is the curated which command index: novel hero features
+	// first, then promoted endpoint commands, deduped by Command.
+	WhichIndex []whichIndexEntry
 }
 
 type generatorTemplateData struct {
@@ -1180,6 +1185,7 @@ func (g *Generator) readmeData() *readmeTemplateData {
 		TrafficAnalysis:       g.trafficAnalysisData(),
 		PromotedResourceNames: g.PromotedResourceNames,
 		PromotedEndpointNames: g.PromotedEndpointNames,
+		WhichIndex:            g.whichIndexEntries(),
 	}
 }
 
@@ -3326,6 +3332,9 @@ func (g *Generator) renderOptionalSupportFiles() error {
 // LearnConfig values, which the per-CLI startup wires via NewConfig
 // and SeedFromConfig at first run.
 func (g *Generator) renderLearnFiles() error {
+	if err := validateLearnTickerPlaybookReachability(g.Spec.Learn, g.OutputDir); err != nil {
+		return err
+	}
 	learnData := struct {
 		*spec.APISpec
 		HasSync bool
@@ -3442,6 +3451,9 @@ func (g *Generator) Generate() error {
 	// rendering.
 	g.PromotedCommands, g.PromotedResourceNames, g.PromotedEndpointNames = buildPromotedCommandPlan(g.Spec)
 	if err := validateCommandSurface(buildCommandSurface(g.Spec, g.PromotedCommands), g.activeFrameworkCobraUseNames()); err != nil {
+		return err
+	}
+	if err := g.validatePromotedExamples(); err != nil {
 		return err
 	}
 
@@ -5890,6 +5902,9 @@ func (g *Generator) renderRootProjectFiles(promotedCommands []PromotedCommand, p
 	}
 	if err := g.renderTemplate("goreleaser.yaml.tmpl", ".goreleaser.yaml", rootData); err != nil {
 		return fmt.Errorf("rendering goreleaser: %w", err)
+	}
+	if err := g.renderTemplate("gitignore.tmpl", ".gitignore", rootData); err != nil {
+		return fmt.Errorf("rendering gitignore: %w", err)
 	}
 
 	return nil
@@ -9358,19 +9373,12 @@ func (g *Generator) exampleLine(commandPath, endpointName string, endpoint spec.
 	return "  " + strings.Join(parts, " ")
 }
 
-func (g *Generator) promotedExampleLine(promotedName string, endpoint spec.Endpoint) string {
-	if strings.TrimSpace(endpoint.Example) != "" {
-		return endpoint.Example
+func (g *Generator) promotedExampleLine(promotedName, endpointName string, endpoint spec.Endpoint) string {
+	line, err := g.resolvePromotedExample(promotedName, endpointName, endpoint)
+	if err != nil {
+		return g.synthesizedPromotedExample(toKebab(promotedName), endpoint)
 	}
-
-	promotedName = toKebab(promotedName)
-	if line, ok := g.narrativeExampleLine([]string{promotedName}, endpoint); ok {
-		return line
-	}
-
-	parts := []string{naming.CLI(g.Spec.Name), promotedName}
-	parts = append(parts, commandExampleArgParts(endpoint)...)
-	return "  " + strings.Join(parts, " ")
+	return line
 }
 
 func (g *Generator) narrativeExampleLine(commandParts []string, endpoint spec.Endpoint) (string, bool) {

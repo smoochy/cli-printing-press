@@ -48,6 +48,8 @@ func TestGenerateProjectsCompile(t *testing.T) {
 	mustInclude := []string{
 		"go.mod",
 		"Makefile",
+		".gitignore",
+		".goreleaser.yaml",
 		"AGENTS.md",
 		"CLAUDE.md",
 		"README.md",
@@ -151,9 +153,10 @@ func TestGenerateProjectsCompile(t *testing.T) {
 		// +1: cmd/<cli>-pp-mcp/http_auth_test.go for the HTTP caller-auth contract.
 		// +4: cliutil.WithFileLock (filelock.go + unix/windows + test) so
 		// learn-loop audit/teach.log rotation is cross-process safe.
-		{name: "stytch", specPath: filepath.Join("..", "..", "testdata", "stytch.yaml"), expectedFiles: 176},
-		{name: "clerk", specPath: filepath.Join("..", "..", "testdata", "clerk.yaml"), expectedFiles: 180},
-		{name: "loops", specPath: filepath.Join("..", "..", "testdata", "loops.yaml"), expectedFiles: 178},
+		// +1: root .gitignore so local binaries are ignored without hiding cmd/<name>/.
+		{name: "stytch", specPath: filepath.Join("..", "..", "testdata", "stytch.yaml"), expectedFiles: 177},
+		{name: "clerk", specPath: filepath.Join("..", "..", "testdata", "clerk.yaml"), expectedFiles: 181},
+		{name: "loops", specPath: filepath.Join("..", "..", "testdata", "loops.yaml"), expectedFiles: 179},
 	}
 
 	for _, tt := range tests {
@@ -12379,8 +12382,9 @@ func TestGeneratedDoctor_HealthCheckPathProbesEndpoint(t *testing.T) {
 	doctorSrc := readGeneratedFile(t, outputDir, "internal", "cli", "doctor.go")
 	assert.Contains(t, doctorSrc, `healthPath := "api/marketStatus"`)
 	assert.Contains(t, doctorSrc, `if !strings.HasPrefix(healthPath, "/") {`)
-	assert.Contains(t, doctorSrc, `reachBody, reachErr := c.Get(cmd.Context(), healthPath, nil)`)
+	assert.Contains(t, doctorSrc, `reachBody, reachErr := c.GetWithHeaders(cmd.Context(), healthPath, nil, map[string]string{client.HTMLResponseHeader: "true"})`)
 	assert.NotContains(t, doctorSrc, `reachBody, reachErr := c.Get(cmd.Context(), "/", nil)`)
+	assert.NotContains(t, doctorSrc, `reachBody, reachErr := c.Get(cmd.Context(), healthPath, nil)`)
 }
 
 func TestGeneratedDoctor_InterstitialMarkersAreTitleAnchored(t *testing.T) {
@@ -13168,7 +13172,8 @@ func TestGenerateWhichDoesNotFallbackToEndpointGuesses(t *testing.T) {
 	whichGo, err := os.ReadFile(filepath.Join(outputDir, "internal", "cli", "which.go"))
 	require.NoError(t, err)
 	whichSrc := string(whichGo)
-	assert.Contains(t, whichSrc, `var whichIndex = []whichEntry{}`)
+	assert.Contains(t, whichSrc, `Command: "products"`)
+	assert.Contains(t, whichSrc, `pp:which-promoted`)
 	assert.NotContains(t, whichSrc, `Command: "products list"`)
 	assert.NotContains(t, whichSrc, `Command: "products reviews list"`)
 	assert.Contains(t, whichSrc, `"pp:typed-exit-codes": "0,2"`)
@@ -13178,7 +13183,8 @@ func TestGenerateWhichDoesNotFallbackToEndpointGuesses(t *testing.T) {
 	runGoCommand(t, outputDir, "build", "-o", binaryPath, "./cmd/whichfallback-pp-cli")
 	whichOut, err := exec.Command(binaryPath, "which", "reviews", "--json").CombinedOutput()
 	require.Error(t, err)
-	assert.Contains(t, string(whichOut), "no curated capability index")
+	assert.NotContains(t, string(whichOut), "no curated capability index")
+	assert.Contains(t, string(whichOut), `"matches"`)
 }
 
 func graphQLBFFCaptureEntry(operationName, variablesJSON, hash string) browsersniff.EnrichedEntry {
