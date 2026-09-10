@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -2586,17 +2587,65 @@ func countFiles(t *testing.T, root string) int {
 
 func runGoCommand(t *testing.T, dir string, args ...string) {
 	t.Helper()
+	runGoCommandWithEnv(t, dir, nil, args...)
+}
+
+func runGoCommandWithEnv(t *testing.T, dir string, extraEnv []string, args ...string) {
+	t.Helper()
 	if testing.Short() && len(args) > 0 && (args[0] == "build" || args[0] == "test") {
 		t.Skip("generated CLI compile tests run in the full generated-test CI lane")
 	}
-	runGoCommandRequired(t, dir, args...)
+	output, err := runGoCommandOutputWithEnv(t, dir, extraEnv, args...)
+	require.NoError(t, err, output)
 }
 
 func requireGeneratedCompiles(t *testing.T, dir string) {
 	t.Helper()
+	requireGeneratedCompilesWithEnv(t, dir, nil)
+}
+
+func requireGeneratedCompilesWithEnv(t *testing.T, dir string, extraEnv []string) {
+	t.Helper()
 	// No-op in this test harness; module resolution is exercised via -mod=mod.
-	runGoCommand(t, dir, "mod", "tidy")
-	runGoCommand(t, dir, "build", "./...")
+	runGoCommandWithEnv(t, dir, extraEnv, "mod", "tidy")
+	runGoCommandWithEnv(t, dir, extraEnv, "build", "./...")
+}
+
+const go127Toolchain = "go1.27.0"
+
+var (
+	go127Once   sync.Once
+	go127Avail  bool
+	go127Reason string
+)
+
+func go127ToolchainAvailable(t *testing.T) bool {
+	t.Helper()
+	go127Once.Do(func() {
+		cmd := exec.Command("go", "version")
+		cmd.Env = append(os.Environ(), "GOTOOLCHAIN="+go127Toolchain)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			go127Reason = strings.TrimSpace(string(out) + " " + err.Error())
+			return
+		}
+		go127Avail = strings.Contains(string(out), "go1.27")
+		if !go127Avail {
+			go127Reason = strings.TrimSpace(string(out))
+		}
+	})
+	if !go127Avail && go127Reason != "" {
+		t.Logf("Go 1.27 toolchain unavailable: %s", go127Reason)
+	}
+	return go127Avail
+}
+
+func requireGeneratedCompilesGo127(t *testing.T, dir string) {
+	t.Helper()
+	if !go127ToolchainAvailable(t) {
+		t.Skip("Go 1.27 toolchain not available to typecheck enetx/http2's go1.27-tagged source")
+	}
+	requireGeneratedCompilesWithEnv(t, dir, []string{"GOTOOLCHAIN=" + go127Toolchain})
 }
 
 func runGoCommandRequired(t *testing.T, dir string, args ...string) {
@@ -2610,6 +2659,11 @@ func runGoCommandRequired(t *testing.T, dir string, args ...string) {
 // command to fail use this directly; runGoCommandRequired wraps it for
 // the usual must-succeed case.
 func runGoCommandOutput(t *testing.T, dir string, args ...string) (string, error) {
+	t.Helper()
+	return runGoCommandOutputWithEnv(t, dir, nil, args...)
+}
+
+func runGoCommandOutputWithEnv(t *testing.T, dir string, extraEnv []string, args ...string) (string, error) {
 	t.Helper()
 
 	// Generated-project compile tests exercise module resolution via -mod=mod;
@@ -2627,6 +2681,7 @@ func runGoCommandOutput(t *testing.T, dir string, args ...string) (string, error
 	require.NoError(t, err)
 	cmd.Env = append(os.Environ(), "GOCACHE="+cacheDir)
 	cmd.Env = append(cmd.Env, sandboxHomeEnv(t)...)
+	cmd.Env = append(cmd.Env, extraEnv...)
 	output, err := cmd.CombinedOutput()
 	return string(output), err
 }
@@ -2850,6 +2905,7 @@ func TestGenerateBrowserChromeTransport(t *testing.T) {
 	assert.Contains(t, string(gomod), "go "+currentGoDirectiveVersion()+"\n")
 	assert.Contains(t, string(gomod), "toolchain "+currentGoToolchainVersion())
 	assert.Contains(t, string(gomod), "github.com/enetx/surf")
+	assert.Contains(t, string(gomod), "github.com/enetx/http "+safeEnetxHTTPVersion)
 
 	clientGo, err := os.ReadFile(filepath.Join(outputDir, "internal", "client", "client.go"))
 	require.NoError(t, err)
@@ -2862,8 +2918,9 @@ func TestGenerateBrowserChromeTransport(t *testing.T) {
 	readme, err := os.ReadFile(filepath.Join(outputDir, "README.md"))
 	require.NoError(t, err)
 	assert.Contains(t, string(readme), "Chrome-compatible HTTP transport")
-	// The H3 sibling below compiles the same surf-backed client path; this
-	// test stays focused on the non-H3 rendering branch.
+
+	requireGeneratedCompiles(t, outputDir)
+	requireGeneratedCompilesGo127(t, outputDir)
 }
 
 func TestGenerateBrowserChromeH3Transport(t *testing.T) {
@@ -3280,12 +3337,15 @@ func TestGenerateCookieHTMLDefaultsBrowserChromeTransport(t *testing.T) {
 
 	gomod := readGeneratedFile(t, outputDir, "go.mod")
 	assert.Contains(t, gomod, "github.com/enetx/surf")
+	assert.Contains(t, gomod, "github.com/enetx/http "+safeEnetxHTTPVersion)
 
 	clientGo := readGeneratedFile(t, outputDir, "internal", "client", "client.go")
 	assert.Contains(t, clientGo, `"github.com/enetx/surf"`)
 	assert.Contains(t, clientGo, "Impersonate()")
 	assert.Contains(t, clientGo, "Chrome()")
 	assert.NotContains(t, clientGo, `req.Header.Set("User-Agent", "cookiehtml-pp-cli/0.1.0")`)
+
+	requireGeneratedCompiles(t, outputDir)
 }
 
 func TestGenerateHTMLExtractionEndpoint(t *testing.T) {
@@ -8309,8 +8369,10 @@ func TestEndpointFixturesEmittedFromSpec(t *testing.T) {
 		"non-promoted endpoint commands should carry spec-declared live dogfood tier requirements")
 
 	withoutHappyArgs := readGeneratedFile(t, outputDir, "internal", "cli", "items_get.go")
-	assert.Contains(t, withoutHappyArgs, `Example:     "  endpoint-fixtures-pp-cli items get 550e8400-e29b-41d4-a716-446655440000"`,
-		"endpoints without example must keep the existing synthesized example")
+	assert.NotContains(t, withoutHappyArgs, "550e8400-e29b-41d4-a716-446655440000",
+		"endpoints without a derivable id must not invent a synthetic UUID Example")
+	assert.NotContains(t, withoutHappyArgs, "Example:",
+		"endpoints without a derivable id must omit the synthesized Cobra Example")
 	assert.NotContains(t, withoutHappyArgs, "pp:happy-args",
 		"endpoints without happy_args must keep the existing annotation shape")
 	assert.NotContains(t, withoutHappyArgs, "pp:requires-tier",
@@ -9737,7 +9799,8 @@ func TestGeneratedOutput_PromotedCommandKeepsSubresourceParents(t *testing.T) {
 
 	cardsSrc, err := os.ReadFile(filepath.Join(outputDir, "internal", "cli", "account_cards_get-account.go"))
 	require.NoError(t, err)
-	assert.Regexp(t, `Example:\s+"  promsub-pp-cli account cards get-account `, string(cardsSrc))
+	assert.Contains(t, string(cardsSrc), `"get-account <accountId>"`)
+	assert.NotContains(t, string(cardsSrc), "550e8400-e29b-41d4-a716-446655440000")
 	assert.NotRegexp(t, `Example:\s+"  promsub-pp-cli account get-account `, string(cardsSrc))
 }
 
@@ -9751,17 +9814,18 @@ func TestExampleLineUsesRenderedCommandAndFlagNames(t *testing.T) {
 		Method: "POST",
 		Path:   "/account/{accountId}/request-send-money",
 		Params: []spec.Param{
-			{Name: "accountId", Type: "string", Required: true, Positional: true},
+			{Name: "accountId", Type: "string", Required: true, Positional: true, Example: "acct_123"},
 		},
 		Body: []spec.Param{
-			{Name: "idempotencyKey", Type: "string", Required: true},
+			{Name: "idempotencyKey", Type: "string", Required: true, Example: "idem-1"},
 		},
 	}
 
 	got := g.exampleLine("account request-send-money", "request_send_money", endpoint)
 
 	assert.Contains(t, got, "example-render-pp-cli account request-send-money request-send-money")
-	assert.Contains(t, got, "--idempotency-key your-token-here")
+	assert.Contains(t, got, "acct_123")
+	assert.Contains(t, got, "--idempotency-key idem-1")
 	assert.NotContains(t, got, "request_send_money")
 	assert.NotContains(t, got, "--idempotencyKey")
 }
@@ -9915,11 +9979,15 @@ func TestGeneratedCommandExampleKeepsDispatchParamDefault(t *testing.T) {
 
 	rankSrc, err := os.ReadFile(filepath.Join(outputDir, "internal", "cli", "domain_rank.go"))
 	require.NoError(t, err)
-	assert.Contains(t, string(rankSrc), `dispatch-default-pp-cli domain rank --type domain_rank --domain example-value`)
+	assert.NotContains(t, string(rankSrc), "example-value")
+	assert.NotContains(t, string(rankSrc), "TODO: replace placeholder example values")
+	assert.NotContains(t, string(rankSrc), "Example:")
+	assert.NotContains(t, string(rankSrc), "pp:happy-args")
 
 	listSrc, err := os.ReadFile(filepath.Join(outputDir, "internal", "cli", "domain_list.go"))
 	require.NoError(t, err)
-	assert.Contains(t, string(listSrc), `dispatch-default-pp-cli domain list --limit 50`)
+	assert.Contains(t, string(listSrc), `dispatch-default-pp-cli domain list --limit 100`)
+	assert.Contains(t, string(listSrc), `"pp:happy-args": "--limit=100"`)
 }
 
 func TestGeneratedCommandExampleUsesSchemaHintsForRequiredParams(t *testing.T) {
@@ -9956,8 +10024,12 @@ func TestGeneratedCommandExampleUsesSchemaHintsForRequiredParams(t *testing.T) {
 	require.NoError(t, New(apiSpec, outputDir).Generate())
 
 	source := readGeneratedFile(t, outputDir, "internal", "cli", "reports_create.go")
-	assert.Contains(t, source, `schema-hints-pp-cli reports create --example-param from-example --enum-param snippet --default-param from-default --app INSTANTLY --fallback example-value --kind summary`)
-	assert.Contains(t, source, `// TODO: replace placeholder example values before relying on this for live dogfood.`)
+	assert.NotContains(t, source, "example-value",
+		"mixed derivable/underivable required params must not ship placeholder Example strings")
+	assert.NotContains(t, source, `// TODO: replace placeholder example values before relying on this for live dogfood.`)
+	assert.NotContains(t, source, "pp:happy-args",
+		"happy-args must stay unset when any required input is underivable")
+	assert.NotContains(t, source, "Example:")
 	requireGeneratedCompiles(t, outputDir)
 }
 
@@ -10033,8 +10105,10 @@ func TestGeneratedCommandExampleFallsBackWhenNarrativeDoesNotMatchCommand(t *tes
 	require.NoError(t, gen.Generate())
 
 	source := readGeneratedFile(t, outputDir, "internal", "cli", "users_list.go")
-	assert.Contains(t, source, `narrative-fallback-pp-cli users list --pcgs-no example-value`)
+	assert.NotContains(t, source, "example-value")
 	assert.NotContains(t, source, "p_12345")
+	assert.NotContains(t, source, "Example:")
+	assert.NotContains(t, source, "pp:happy-args")
 }
 
 func TestGeneratedCommandExampleUsesNarrativeRecipeWhenQuickStartDoesNotMatch(t *testing.T) {
@@ -10338,8 +10412,9 @@ func TestGeneratedPromotedCommandExampleRejectsNarrativeChildCommand(t *testing.
 	require.NoError(t, gen.Generate())
 
 	source := readGeneratedFile(t, outputDir, "internal", "cli", "promoted_account.go")
-	assert.Contains(t, source, `"  narrative-promoted-child-pp-cli account 550e8400-e29b-41d4-a716-446655440000"`)
+	assert.NotContains(t, source, "550e8400-e29b-41d4-a716-446655440000")
 	assert.NotContains(t, source, "account cards get-account")
+	assert.NotContains(t, source, "Example:")
 }
 
 func TestGeneratedPromotedCommandExampleRejectsUnpromotedNarrativePath(t *testing.T) {
@@ -10370,8 +10445,9 @@ func TestGeneratedPromotedCommandExampleRejectsUnpromotedNarrativePath(t *testin
 	require.NoError(t, gen.Generate())
 
 	source := readGeneratedFile(t, outputDir, "internal", "cli", "promoted_lookup.go")
-	assert.Contains(t, source, `"  narrative-unpromoted-path-pp-cli lookup --pcgs-no example-value"`)
+	assert.NotContains(t, source, "example-value")
 	assert.NotContains(t, source, `"  narrative-unpromoted-path-pp-cli lookup create --pcgs-no 7356"`)
+	assert.NotContains(t, source, "Example:")
 }
 
 func TestDetectAgentMoneyWorkflowFromGenericMoneyMovementShape(t *testing.T) {
@@ -12102,7 +12178,8 @@ func TestGeneratedAuthCredentialCommandReferencesMatchCobraTree(t *testing.T) {
 		client := readGeneratedFile(t, outputDir, "internal", "client", "client.go")
 		assert.Contains(t, client, "auth set-credentials")
 		doctor := readGeneratedFile(t, outputDir, "internal", "cli", "doctor.go")
-		assert.Contains(t, doctor, `credentialRemediation := "run auth set-credentials or auth logout"`)
+		assert.Contains(t, doctor, `remediationHint := "run auth set-credentials or auth logout"`)
+		assert.NotContains(t, doctor, "credentialRemediation")
 	})
 }
 
@@ -19386,7 +19463,9 @@ func TestGeneratePublicParamNamesAcrossCLISurfaces(t *testing.T) {
 	require.NoError(t, New(apiSpec, outputDir).Generate())
 
 	findSource := readGeneratedFile(t, outputDir, "internal", "cli", "stores_find.go")
-	assert.Contains(t, findSource, `public-params-pp-cli stores find --address example-value --city example-value`)
+	assert.NotContains(t, findSource, "example-value")
+	assert.NotContains(t, findSource, "Example:")
+	assert.NotContains(t, findSource, "pp:happy-args")
 	assert.Contains(t, findSource, `StringVar(&flagS, "address", "", "Street address")`)
 	assert.Contains(t, findSource, `StringVar(&flagS, "s", "", "Street address")`)
 	assert.Contains(t, findSource, `_ = cmd.Flags().MarkHidden("s")`)
@@ -19395,7 +19474,9 @@ func TestGeneratePublicParamNamesAcrossCLISurfaces(t *testing.T) {
 	assert.NotContains(t, findSource, `required flag "s" not set`)
 
 	createSource := readGeneratedFile(t, outputDir, "internal", "cli", "stores_create.go")
-	assert.Contains(t, createSource, `public-params-pp-cli stores create --store-code example-value`)
+	assert.NotContains(t, createSource, "example-value")
+	assert.NotContains(t, createSource, "Example:")
+	assert.NotContains(t, createSource, "pp:happy-args")
 	assert.Contains(t, createSource, `StringVar(&bodyStoreCode, "store-code", "", "Store code")`)
 	assert.Contains(t, createSource, `bodyMap["store_code"] = bodyStoreCode`)
 
@@ -19648,7 +19729,9 @@ func TestGeneratePublicParamNamesInPromotedExamples(t *testing.T) {
 	require.NoError(t, New(apiSpec, outputDir).Generate())
 
 	promotedSource := readGeneratedFile(t, outputDir, "internal", "cli", "promoted_checkout.go")
-	assert.Regexp(t, `Example:\s+"  promoted-public-params-pp-cli checkout --store-code example-value"`, promotedSource)
+	assert.NotContains(t, promotedSource, "example-value")
+	assert.NotContains(t, promotedSource, "Example:")
+	assert.NotContains(t, promotedSource, "pp:happy-args")
 }
 
 // TestGenerateMCPCodeOrchKeywordsHasStopwordFilter proves the keyword
