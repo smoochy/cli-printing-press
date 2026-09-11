@@ -400,7 +400,7 @@ func TestGenerateCliutilPackage(t *testing.T) {
 
 	cliutilTestSrc, err := os.ReadFile(filepath.Join(cliutilDir, "cliutil_test.go"))
 	require.NoError(t, err)
-	assert.Contains(t, string(cliutilTestSrc), "token=abc.def-ghi",
+	assert.Contains(t, string(cliutilTestSrc), "token=your-token-here",
 		"emitted cliutil tests must cover token=<value> credential redaction")
 
 	// The generated cliutil package must compile and its tests must pass.
@@ -3492,7 +3492,7 @@ func TestGenerateHTMLExtractionEndpoint(t *testing.T) {
 	require.FileExists(t, filepath.Join(outputDir, "internal", "cli", "html_extract.go"))
 	gomod, err := os.ReadFile(filepath.Join(outputDir, "go.mod"))
 	require.NoError(t, err)
-	assert.Contains(t, string(gomod), "golang.org/x/net v0.55.0")
+	assert.Contains(t, string(gomod), "golang.org/x/net "+safeXNetVersion)
 
 	runGoCommand(t, outputDir, "mod", "tidy")
 	binaryPath := filepath.Join(outputDir, "webhtml-pp-cli")
