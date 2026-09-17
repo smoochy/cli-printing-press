@@ -48,11 +48,11 @@ func newProjectsListCmd(flags *rootFlags) *cobra.Command {
 				headerOverrides["X-Api-Version"] = formatCLIParamValue(flagXApiVersion)
 			}
 
-			data, prov, err := resolvePaginatedReadWithStrategy(cmd.Context(), c, flags, "auto", "projects", path, map[string]string{
+			data, prov, err := resolvePaginatedReadWithStrategy(cmd.Context(), c, flags, "auto", "projects", path, retainCLIQueryParams(cmd, map[string]string{
 				"status": formatCLIParamValue(flagStatus),
 				"limit":  formatCLIParamValue(flagLimit),
 				"cursor": formatCLIParamValue(flagCursor),
-			}, headerOverrides, flagAll, "cursor", "cursor", "limit", 25, "", "", "", cmd.ErrOrStderr())
+			}, map[string][]string{"status": {"status"}, "limit": {"limit"}, "cursor": {"cursor"}}, "cursor", "cursor"), headerOverrides, flagAll, "cursor", "cursor", "limit", 25, "", "", "", cmd.ErrOrStderr())
 			if err != nil {
 				return classifyAPIError(cmd.OutOrStdout(), err, flags)
 			}
@@ -73,9 +73,10 @@ func newProjectsListCmd(flags *rootFlags) *cobra.Command {
 			// --plain) opt out of the auto-JSON path so piped consumers that asked for
 			// a non-JSON format reach the standard pipeline below.
 			if flags.asJSON || (!isTerminal(cmd.OutOrStdout()) && !flags.csv && !flags.quiet && !flags.plain) {
+				var selectErr error
 				filtered := data
 				if flags.selectFields != "" {
-					filtered = filterFields(filtered, flags.selectFields)
+					filtered, selectErr = filterFieldsChecked(filtered, flags.selectFields)
 				} else if flags.compact {
 					filtered = compactFields(filtered, map[string]bool{"id": true, "name": true, "status": true})
 				}
@@ -87,7 +88,10 @@ func newProjectsListCmd(flags *rootFlags) *cobra.Command {
 				if wrapErr != nil {
 					return wrapErr
 				}
-				return printOutput(cmd.OutOrStdout(), wrapped, true)
+				if err := printOutput(cmd.OutOrStdout(), wrapped, true); err != nil {
+					return err
+				}
+				return selectErr
 			}
 			// For all other output modes (table, csv, plain, quiet), use the standard pipeline
 			if wantsHumanTable(cmd.OutOrStdout(), flags) {

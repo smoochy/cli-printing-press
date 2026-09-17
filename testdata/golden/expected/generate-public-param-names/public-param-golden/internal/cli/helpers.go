@@ -686,6 +686,62 @@ func writeAPIErrorEnvelope(w io.Writer, flags *rootFlags, err error, code int) {
 	})
 }
 
+// Printed CLIs need an API-specific way to distinguish known console or landing
+// pages from generic authentication failures, so wrong base URLs can produce
+// actionable guidance without changing classification for every HTML body.
+var classifyHTMLPayload func(trimmed []byte) error
+
+func applyHTMLPayloadClassifier(trimmed []byte) error {
+	if classifyHTMLPayload == nil {
+		return nil
+	}
+	return classifyHTMLPayload(bytes.TrimSpace(trimmed))
+}
+
+func htmlLooksLikeAuthFailure(trimmed []byte) bool {
+	if len(trimmed) == 0 {
+		return false
+	}
+	lower := strings.ToLower(string(trimmed))
+	for _, marker := range []string{
+		"unauthorized",
+		"forbidden",
+		"session expired",
+		"not authenticated",
+		"authentication required",
+		"authentication failed",
+		"invalid api key",
+		"invalid token",
+		"invalid credential",
+		"www-authenticate",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func htmlEvidenceFromTransportError(err error) []byte {
+	msg := err.Error()
+	const marker = "returned HTML instead of JSON"
+	if idx := strings.Index(msg, marker); idx >= 0 {
+		return []byte(msg[idx+len(marker):])
+	}
+	return []byte(msg)
+}
+
+func classifyHTMLTransportError(err error) error {
+	evidence := htmlEvidenceFromTransportError(err)
+	if classified := applyHTMLPayloadClassifier(evidence); classified != nil {
+		return classified
+	}
+	if htmlLooksLikeAuthFailure(evidence) {
+		return authErr(fmt.Errorf("not authenticated or session expired; API returned HTML instead of JSON. " + ""))
+	}
+	return apiErr(fmt.Errorf("%w\nhint: the request may have reached a web page or the wrong endpoint", err))
+}
+
 // classifyAPIErrorOnly maps API errors to structured exit codes without writing.
 // Hand-written commands should use this helper when they own output sequencing.
 func classifyAPIErrorOnly(err error) error {
@@ -711,6 +767,8 @@ func classifyAPIErrorOnly(err error) error {
 		return notFoundErr(fmt.Errorf("%w\nhint: resource not found. Run the 'list' command to see available items", err))
 	case strings.Contains(msg, "HTTP 429"):
 		return rateLimitErr(err)
+	case strings.Contains(msg, "returned HTML instead of JSON"):
+		return classifyHTMLTransportError(err)
 	default:
 		return apiErr(err)
 	}
@@ -809,6 +867,48 @@ func paginatedGetWithResponsePath(ctx context.Context, c interface {
 	return applyResponsePath(data, responsePath), nil
 }
 
+// Generated commands stringify every flag, so an unset default and an
+// operator-set --flag=false or --n=0 are the same "false"/"0" bytes.
+// Explicit false/0 must stay on the wire; otherwise a boolean that
+// defaults to true is accepted and never reaches the API.
+func retainCLIQueryParams(cmd *cobra.Command, params map[string]string, flagNamesByWire map[string][]string, cursorParam, paginationType string) map[string]string {
+	explicit := map[string]struct{}{}
+	for wire := range params {
+		names, tracked := flagNamesByWire[wire]
+		if !tracked {
+			explicit[wire] = struct{}{}
+			continue
+		}
+		if cmd == nil {
+			continue
+		}
+		for _, name := range names {
+			if cmd.Flags().Changed(name) {
+				explicit[wire] = struct{}{}
+				break
+			}
+		}
+	}
+	return retainExplicitQueryParams(params, explicit, cursorParam, paginationType)
+}
+
+func retainExplicitQueryParams(params map[string]string, explicit map[string]struct{}, cursorParam, paginationType string) map[string]string {
+	clean := map[string]string{}
+	for k, v := range params {
+		if v == "" {
+			continue
+		}
+		if _, ok := explicit[k]; ok {
+			clean[k] = v
+			continue
+		}
+		if (k == cursorParam && paginationType == "offset") || (v != "0" && v != "false") {
+			clean[k] = v
+		}
+	}
+	return clean
+}
+
 // paginatedGet fetches pages and concatenates array results. The headers
 // argument carries per-endpoint required headers (e.g. cal-api-version) that
 // must be sent on every page request, including the first; pass nil when the
@@ -816,16 +916,21 @@ func paginatedGetWithResponsePath(ctx context.Context, c interface {
 func paginatedGet(ctx context.Context, c interface {
 	GetWithHeaders(ctx context.Context, path string, params map[string]string, headers map[string]string) (json.RawMessage, error)
 }, path string, params map[string]string, headers map[string]string, fetchAll bool, cursorParam, paginationType, limitParam string, defaultPageSize int, nextCursorPath, hasMoreField string) (json.RawMessage, error) {
-	// The cursor param is exempt from the "0"/"false" strip only for offset
-	// pagination, where offset=0 is a legitimate first page. Under id-cursor
-	// pagination 0 is not a real record id: APIs answer it with an empty page,
-	// so an unset cursor flag would silently empty every list command.
+	// Generated commands run retainCLIQueryParams first so unset "0"/"false"
+	// never reach this loop. Values that remain — including operator-set
+	// false/0 — go on the wire. Empty strings are still dropped. The offset
+	// cursor is exempt so offset=0 is a legitimate first page. Under
+	// id-cursor pagination 0 is not a real record id: APIs answer it with
+	// an empty page, so cursor=0 must not survive as an unset flag.
 	clean := map[string]string{}
 	for k, v := range params {
 		if v == "" {
 			continue
 		}
-		if (k == cursorParam && paginationType == "offset") || (v != "0" && v != "false") {
+		if k == cursorParam && paginationType != "offset" && v == "0" {
+			continue
+		}
+		if (k == cursorParam && paginationType == "offset") || v != "" {
 			clean[k] = v
 		}
 	}
@@ -1948,7 +2053,14 @@ func unwrapSingleKeyArray(data json.RawMessage) json.RawMessage {
 // filterFields keeps only the specified fields (comma-separated) from JSON objects/arrays.
 // Supports dotted paths like "events.shortName" to descend into nested structures.
 // Arrays are traversed element-wise: "events.shortName" keeps shortName on each event.
+// This one-value wrapper stays so preserved novel commands keep compiling.
+// Generated output sites use filterFieldsChecked so a total miss can exit non-zero.
 func filterFields(data json.RawMessage, fields string) json.RawMessage {
+	filtered, _ := filterFieldsChecked(data, fields)
+	return filtered
+}
+
+func filterFieldsChecked(data json.RawMessage, fields string) (json.RawMessage, error) {
 	var paths [][]string
 	var requestedPaths []string
 	for _, f := range strings.Split(fields, ",") {
@@ -1964,13 +2076,14 @@ func filterFields(data json.RawMessage, fields string) json.RawMessage {
 		paths = append(paths, parts)
 	}
 	if len(paths) == 0 {
-		return data
+		return data, nil
 	}
 	filtered, state := filterFieldsRec(data, paths, true)
 	valid := ""
+	var unmatched []string
 	for i, path := range paths {
 		_, pathState := filterFieldsRec(data, [][]string{path}, true)
-		pathIndeterminate := pathState.anchoredIndeterminate || (len(paths) == 1 && pathState.fallbackIndeterminate)
+		pathIndeterminate := pathState.anchoredIndeterminate || pathState.fallbackIndeterminate
 		if pathState.matched || pathIndeterminate {
 			continue
 		}
@@ -1981,11 +2094,16 @@ func filterFields(data json.RawMessage, fields string) json.RawMessage {
 			}
 		}
 		fmt.Fprintf(os.Stderr, "warning: --select %q matched no fields; valid fields: %s\n", requestedPaths[i], valid)
+		unmatched = append(unmatched, requestedPaths[i])
 	}
+	out := filtered
 	if !state.matched && !state.anchoredIndeterminate && !state.fallbackIndeterminate {
-		return data
+		out = data
 	}
-	return filtered
+	if len(unmatched) > 0 && len(unmatched) == len(requestedPaths) && !state.anchoredIndeterminate && !state.fallbackIndeterminate {
+		return out, usageErr(fmt.Errorf("--select matched no fields: %s", strings.Join(unmatched, ", ")))
+	}
+	return out, nil
 }
 
 func selectFieldKeys(data json.RawMessage) []string {
@@ -2262,8 +2380,9 @@ func printOutputWithFlagsMeta(w io.Writer, data json.RawMessage, flags *rootFlag
 	// must not strip those fields out before --select can pick them. When
 	// only --compact is set (e.g., --agent without --select), the allow-list
 	// still runs.
+	var selectErr error
 	if flags.selectFields != "" {
-		data = filterFields(data, flags.selectFields)
+		data, selectErr = filterFieldsChecked(data, flags.selectFields)
 	} else if flags.compact {
 		data = compactFields(data, documentedFields...)
 	}
@@ -2287,7 +2406,10 @@ func printOutputWithFlagsMeta(w io.Writer, data json.RawMessage, flags *rootFlag
 	}
 	// --quiet: one identity value per row (id, then name/slug/title).
 	if flags.quiet {
-		return printQuiet(w, data)
+		if err := printQuiet(w, data); err != nil {
+			return err
+		}
+		return selectErr
 	}
 	headerFields := documentedFields
 	if flags.selectFields != "" {
@@ -2300,15 +2422,19 @@ func printOutputWithFlagsMeta(w io.Writer, data json.RawMessage, flags *rootFlag
 		}
 		headerFields = []map[string]bool{selected}
 	}
-	// --csv: render as CSV
-	if flags.csv {
-		return printCSV(w, data, headerFields...)
+	var printErr error
+	switch {
+	case flags.csv:
+		printErr = printCSV(w, data, headerFields...)
+	case flags.plain:
+		printErr = printPlain(w, data, headerFields...)
+	default:
+		printErr = printOutput(w, data, flags.asJSON)
 	}
-	// --plain: render arrays as tab-separated rows
-	if flags.plain {
-		return printPlain(w, data, headerFields...)
+	if printErr != nil {
+		return printErr
 	}
-	return printOutput(w, data, flags.asJSON)
+	return selectErr
 }
 
 // compactVerboseListFields are prose-shaped fields stripped from list-item
@@ -3391,8 +3517,14 @@ func printProvenance(cmd *cobra.Command, count int, prov DataProvenance) {
 
 func nonJSONPayloadError(data json.RawMessage) error {
 	trimmed := bytes.TrimSpace(data)
+	if err := applyHTMLPayloadClassifier(trimmed); err != nil {
+		return err
+	}
 	if len(trimmed) > 0 && trimmed[0] == '<' {
-		return authErr(fmt.Errorf("not authenticated or session expired; API returned HTML instead of JSON. " + ""))
+		if htmlLooksLikeAuthFailure(trimmed) {
+			return authErr(fmt.Errorf("not authenticated or session expired; API returned HTML instead of JSON. " + ""))
+		}
+		return apiErr(fmt.Errorf("API returned HTML instead of JSON; the request may have reached a web page or the wrong endpoint"))
 	}
 	if len(trimmed) == 0 {
 		return apiErr(fmt.Errorf("API returned an empty response body; expected JSON"))
