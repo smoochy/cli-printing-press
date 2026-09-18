@@ -155,8 +155,8 @@ func TestGenerateProjectsCompile(t *testing.T) {
 		// +4: cliutil.WithFileLock (filelock.go + unix/windows + test) so
 		// learn-loop audit/teach.log rotation is cross-process safe.
 		// +1: root .gitignore so local binaries are ignored without hiding cmd/<name>/.
-		{name: "stytch", specPath: filepath.Join("..", "..", "testdata", "stytch.yaml"), expectedFiles: 177},
-		{name: "clerk", specPath: filepath.Join("..", "..", "testdata", "clerk.yaml"), expectedFiles: 181},
+		{name: "stytch", specPath: filepath.Join("..", "..", "testdata", "stytch.yaml"), expectedFiles: 178},
+		{name: "clerk", specPath: filepath.Join("..", "..", "testdata", "clerk.yaml"), expectedFiles: 182},
 		{name: "loops", specPath: filepath.Join("..", "..", "testdata", "loops.yaml"), expectedFiles: 179},
 	}
 
@@ -2677,12 +2677,15 @@ func runGoCommandOutputWithEnv(t *testing.T, dir string, extraEnv []string, args
 
 	cmd := exec.Command("go", args...)
 	cmd.Dir = dir
-	cacheDir, err := goBuildCacheDir(dir)
-	require.NoError(t, err)
-	cmd.Env = append(os.Environ(), "GOCACHE="+cacheDir)
-	cmd.Env = append(cmd.Env, sandboxHomeEnv(t)...)
-	cmd.Env = append(cmd.Env, extraEnv...)
-	output, err := cmd.CombinedOutput()
+	var output []byte
+	err := withGoBuildCache(dir, func(cacheDir string) error {
+		cmd.Env = append(os.Environ(), "GOCACHE="+cacheDir)
+		cmd.Env = append(cmd.Env, sandboxHomeEnv(t)...)
+		cmd.Env = append(cmd.Env, extraEnv...)
+		var runErr error
+		output, runErr = cmd.CombinedOutput()
+		return runErr
+	})
 	return string(output), err
 }
 
@@ -11766,9 +11769,9 @@ func TestGeneratedOutput_ResourceParentsVisibleWhenAPIBrowserGenerated(t *testin
 	t.Parallel()
 
 	// Multi-endpoint resource -> parent group; single-endpoint resource -> promoted command.
-	// The promoted command's presence triggers api_discovery.go emission, but resource
-	// parents must remain visible in root help. API discovery identifies them from command
-	// metadata instead of repurposing Cobra's Hidden bit.
+	// Resource parents trigger api_discovery.go emission. They stay visible in
+	// root help; API discovery identifies them from pp:api-resource metadata
+	// instead of Cobra's Hidden bit.
 	apiSpec := &spec.APISpec{
 		Name:    "hiddentest",
 		Version: "0.1.0",
@@ -11799,6 +11802,12 @@ func TestGeneratedOutput_ResourceParentsVisibleWhenAPIBrowserGenerated(t *testin
 	require.FileExists(t, filepath.Join(outputDir, "internal", "cli", "api_discovery.go"))
 	require.FileExists(t, filepath.Join(outputDir, "internal", "cli", "promoted_customers.go"))
 
+	discovery, err := os.ReadFile(filepath.Join(outputDir, "internal", "cli", "api_discovery.go"))
+	require.NoError(t, err)
+	assert.NotContains(t, string(discovery), "ALL endpoints")
+	assert.NotContains(t, string(discovery), "full API coverage")
+	assert.NotContains(t, string(discovery), "Browse and call any API endpoint")
+
 	orders, err := os.ReadFile(filepath.Join(outputDir, "internal", "cli", "orders.go"))
 	require.NoError(t, err)
 	assert.NotContains(t, string(orders), "Hidden: true",
@@ -11824,9 +11833,9 @@ func TestGeneratedOutput_ResourceParentsVisibleWhenAPIBrowserGenerated(t *testin
 func TestGeneratedOutput_ResourceParentsNotHiddenWithoutAPIBrowser(t *testing.T) {
 	t.Parallel()
 
-	// Without any single-endpoint resource to promote, api_discovery.go is not generated;
-	// hiding the resources in that case would just collapse --help without giving users
-	// a way to list them, so the parent files stay visible.
+	// Multi-endpoint resources emit an api browser even without promoted
+	// shortcuts, and the parents stay visible in --help rather than being
+	// Hidden behind that browser.
 	apiSpec := &spec.APISpec{
 		Name:    "novisibletest",
 		Version: "0.1.0",
@@ -11855,12 +11864,29 @@ func TestGeneratedOutput_ResourceParentsNotHiddenWithoutAPIBrowser(t *testing.T)
 	gen := New(apiSpec, outputDir)
 	require.NoError(t, gen.Generate())
 
-	assert.NoFileExists(t, filepath.Join(outputDir, "internal", "cli", "api_discovery.go"))
+	require.FileExists(t, filepath.Join(outputDir, "internal", "cli", "api_discovery.go"))
+	rootSrc, err := os.ReadFile(filepath.Join(outputDir, "internal", "cli", "root.go"))
+	require.NoError(t, err)
+	assert.Contains(t, string(rootSrc), "newAPICmd(flags)")
+
+	discovery, err := os.ReadFile(filepath.Join(outputDir, "internal", "cli", "api_discovery.go"))
+	require.NoError(t, err)
+	assert.NotContains(t, string(discovery), "ALL endpoints")
+	assert.NotContains(t, string(discovery), "full API coverage")
 
 	orders, err := os.ReadFile(filepath.Join(outputDir, "internal", "cli", "orders.go"))
 	require.NoError(t, err)
 	assert.NotContains(t, string(orders), "Hidden: true",
-		"raw resource parent must not be Hidden when no api browser is generated")
+		"raw resource parent must remain visible when the api browser is generated")
+
+	runGoCommand(t, outputDir, "mod", "tidy")
+	binaryPath := filepath.Join(outputDir, "novisibletest-pp-cli")
+	runGoCommand(t, outputDir, "build", "-o", binaryPath, "./cmd/novisibletest-pp-cli")
+
+	apiOut, err := exec.Command(binaryPath, "api").Output()
+	require.NoError(t, err)
+	assert.Contains(t, string(apiOut), "orders")
+	assert.Contains(t, string(apiOut), "items")
 }
 
 func TestGeneratedOutput_AgentContextIncludesResourceGroups(t *testing.T) {
@@ -15555,10 +15581,13 @@ func TestGraphQLLatestOnlyCanContinueAfterBackwardPageWins(t *testing.T) {
 	selector := "^TestGraphQLLatestOnly(ChoosesBackwardPageForOldestFirst|KeepsForwardPageForNewestFirst|KeepsForwardPageWithoutTimestampEvidence|IgnoresDateLikeNonTimestampFields|ReadsNestedTimestampFields|CanContinueAfterBackwardPageWins)$"
 	listCmd := exec.Command("go", "test", "-mod=mod", "./internal/cli", "-list", selector)
 	listCmd.Dir = outputDir
-	cacheDir, err := goBuildCacheDir(outputDir)
-	require.NoError(t, err)
-	listCmd.Env = append(os.Environ(), "GOCACHE="+cacheDir)
-	listOut, err := listCmd.CombinedOutput()
+	var listOut []byte
+	err = withGoBuildCache(outputDir, func(cacheDir string) error {
+		listCmd.Env = append(os.Environ(), "GOCACHE="+cacheDir)
+		var runErr error
+		listOut, runErr = listCmd.CombinedOutput()
+		return runErr
+	})
 	require.NoError(t, err, string(listOut))
 	for _, name := range []string{
 		"TestGraphQLLatestOnlyChoosesBackwardPageForOldestFirst",
