@@ -14,6 +14,7 @@ import (
 	"github.com/mvanhorn/cli-printing-press/v4/internal/govulncheck"
 	"github.com/mvanhorn/cli-printing-press/v4/internal/naming"
 	"github.com/mvanhorn/cli-printing-press/v4/internal/pipeline"
+	"github.com/mvanhorn/cli-printing-press/v4/internal/spec"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -330,6 +331,10 @@ exit 1
 	assert.JSONEq(t, `"amitav13"`, string(got["printer"]))
 	assert.JSONEq(t, `"Amitav Khandelwal"`, string(got["printer_name"]))
 	assert.JSONEq(t, `{"keep": true}`, string(got["custom_field"]))
+	var creator spec.Person
+	require.NoError(t, json.Unmarshal(got["creator"], &creator))
+	assert.Equal(t, "amitav13", creator.Handle)
+	assert.Equal(t, "Amitav Khandelwal", creator.Name)
 }
 
 func TestBackfillPackagedManifestAttributionPreservesManifestMode(t *testing.T) {
@@ -394,6 +399,48 @@ exit 1
 	require.NoError(t, json.Unmarshal(data, &got))
 	assert.JSONEq(t, `"tmchow"`, string(got["printer"]))
 	assert.JSONEq(t, `"Trevin Chow"`, string(got["printer_name"]))
+	var creator spec.Person
+	require.NoError(t, json.Unmarshal(got["creator"], &creator))
+	assert.Equal(t, "tmchow", creator.Handle)
+	assert.Equal(t, "Trevin Chow", creator.Name)
+}
+
+func TestBackfillPackagedManifestAttributionPreservesExistingCreator(t *testing.T) {
+	stubPublishIdentityCommands(t,
+		`#!/bin/sh
+if [ "$1" = "config" ] && [ "$2" = "github.user" ]; then
+  echo tmchow
+  exit 0
+fi
+if [ "$1" = "config" ] && [ "$2" = "user.name" ]; then
+  echo "Trevin Chow"
+  exit 0
+fi
+exit 1
+`,
+		"#!/bin/sh\nexit 1\n",
+	)
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, pipeline.CLIManifestFilename), []byte(`{
+  "schema_version": 1,
+  "printing_press_version": "4.2.1",
+  "api_name": "test",
+  "cli_name": "test-pp-cli",
+  "run_id": "20260509-000000",
+  "printer": "jane-doe",
+  "printer_name": "Jane Doe",
+  "creator": {"handle":"jane-doe","name":"Jane Doe"}
+}`+"\n"), 0o644))
+
+	require.NoError(t, backfillPackagedManifestAttribution(dir))
+
+	data, err := os.ReadFile(filepath.Join(dir, pipeline.CLIManifestFilename))
+	require.NoError(t, err)
+	var got pipeline.CLIManifest
+	require.NoError(t, json.Unmarshal(data, &got))
+	require.NotNil(t, got.Creator)
+	assert.Equal(t, "jane-doe", got.Creator.Handle)
+	assert.Equal(t, "Jane Doe", got.Creator.Name)
 }
 
 func TestBackfillPackagedManifestAttributionFailsWithoutFallback(t *testing.T) {
@@ -1464,6 +1511,24 @@ func TestPhase5ProofsDirPrefersCanonicalAPIArchive(t *testing.T) {
 	assert.Equal(t, apiProofs, got)
 }
 
+func TestPhase5ProofsDirPrefersCLIManuscripts(t *testing.T) {
+	home := setLibraryTestEnv(t)
+	runID := "20260711-203553-cli-first"
+	cliDir := t.TempDir()
+	cliProofs := filepath.Join(cliDir, ".manuscripts", runID, "proofs")
+	apiProofs := filepath.Join(home, "manuscripts", "test", runID, "proofs")
+	require.NoError(t, os.MkdirAll(cliProofs, 0o755))
+	require.NoError(t, os.MkdirAll(apiProofs, 0o755))
+
+	got := phase5ProofsDir(cliDir, pipeline.CLIManifest{
+		APIName: "test",
+		CLIName: "test-pp-cli",
+		RunID:   runID,
+	})
+
+	assert.Equal(t, cliProofs, got)
+}
+
 func TestPublishPackageCanIncludeRawCaptures(t *testing.T) {
 	home := setLibraryTestEnv(t)
 	cliDir := filepath.Join(home, "library", "test-pp-cli")
@@ -2246,6 +2311,12 @@ func TestListMirrorOnlyFiles(t *testing.T) {
 	require.NoError(t, os.MkdirAll(filepath.Join(mirrorDir, "build"), 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(mirrorDir, "build", "host.tar.gz"), []byte("artifact"), 0o644))
 
+	// Shipcheck reports are stripped from the staged tree, then restored from
+	// the replaced entry. They must not trip the pre-overlay divergence guard.
+	for _, name := range stagedShipcheckReportNames() {
+		require.NoError(t, os.WriteFile(filepath.Join(mirrorDir, name), []byte(`{"passed":true}`+"\n"), 0o644))
+	}
+
 	// File only in source (not a deletion risk).
 	require.NoError(t, os.WriteFile(filepath.Join(srcDir, "NEW.md"), []byte("new in source"), 0o644))
 
@@ -2377,6 +2448,96 @@ func TestPublishPackageDestAllowMirrorDeletionsOverride(t *testing.T) {
 	assert.ErrorIs(t, err, os.ErrNotExist, "mirror-only file should be deleted with override")
 }
 
+func TestPublishPackageDestPreservesMirrorShipcheckReports(t *testing.T) {
+	home := setLibraryTestEnv(t)
+	cliDir := filepath.Join(home, "library", "test-pp-cli")
+	writePublishableTestCLI(t, cliDir)
+	stubPublishPackageValidation(t)
+
+	// Source carries the reports (the hole: the pre-overlay guard compares
+	// mirror vs source, so it does not fire, then the stager strips them).
+	for _, name := range stagedShipcheckReportNames() {
+		require.NoError(t, os.WriteFile(filepath.Join(cliDir, name), []byte(`{"source":true}`+"\n"), 0o644))
+	}
+
+	destDir := filepath.Join(t.TempDir(), "publish-repo")
+	mirrorCLIDir := filepath.Join(destDir, "library", "other", "test")
+	require.NoError(t, os.MkdirAll(mirrorCLIDir, 0o755))
+	for _, name := range stagedShipcheckReportNames() {
+		require.NoError(t, os.WriteFile(filepath.Join(mirrorCLIDir, name), []byte(`{"mirror":true}`+"\n"), 0o644))
+	}
+
+	cmd := newPublishCmd()
+	cmd.SetArgs([]string{"package", "--dir", cliDir, "--category", "other", "--dest", destDir, "--module-path", "github.com/mvanhorn/printing-press-library/library/other/test", "--json"})
+
+	output, err := runWithCapturedStdout(t, cmd.Execute)
+	require.NoError(t, err)
+
+	var result PackageResult
+	require.NoError(t, json.Unmarshal([]byte(output), &result))
+	assert.Equal(t, filepath.Join(destDir, "library", "other", "test"), result.StagedDir)
+
+	for _, name := range stagedShipcheckReportNames() {
+		got, readErr := os.ReadFile(filepath.Join(result.StagedDir, name))
+		require.NoError(t, readErr, "republish must keep catalog shipcheck report %s", name)
+		assert.Equal(t, `{"mirror":true}`+"\n", string(got), "preserved %s should be the catalog copy, not the local source", name)
+		src, srcErr := os.ReadFile(filepath.Join(cliDir, name))
+		require.NoError(t, srcErr)
+		assert.Equal(t, `{"source":true}`+"\n", string(src), "package must not mutate the source-tree report %s", name)
+	}
+}
+
+func TestPublishPackageDestPreservesMirrorOnlyShipcheckReports(t *testing.T) {
+	home := setLibraryTestEnv(t)
+	cliDir := filepath.Join(home, "library", "test-pp-cli")
+	writePublishableTestCLI(t, cliDir)
+	stubPublishPackageValidation(t)
+
+	destDir := filepath.Join(t.TempDir(), "publish-repo")
+	mirrorCLIDir := filepath.Join(destDir, "library", "other", "test")
+	require.NoError(t, os.MkdirAll(mirrorCLIDir, 0o755))
+	for _, name := range stagedShipcheckReportNames() {
+		require.NoError(t, os.WriteFile(filepath.Join(mirrorCLIDir, name), []byte(`{"mirror":true}`+"\n"), 0o644))
+	}
+
+	cmd := newPublishCmd()
+	cmd.SetArgs([]string{"package", "--dir", cliDir, "--category", "other", "--dest", destDir, "--module-path", "github.com/mvanhorn/printing-press-library/library/other/test", "--json"})
+
+	output, err := runWithCapturedStdout(t, cmd.Execute)
+	require.NoError(t, err, "catalog-only shipcheck reports must not trip the divergence guard")
+
+	var result PackageResult
+	require.NoError(t, json.Unmarshal([]byte(output), &result))
+
+	for _, name := range stagedShipcheckReportNames() {
+		got, readErr := os.ReadFile(filepath.Join(result.StagedDir, name))
+		require.NoError(t, readErr, "republish must restore catalog-only shipcheck report %s", name)
+		assert.Equal(t, `{"mirror":true}`+"\n", string(got))
+	}
+}
+
+func TestRestoreStashedShipcheckReportsSkipsNonRegularFiles(t *testing.T) {
+	outDir := t.TempDir()
+	stashed := t.TempDir()
+	secret := filepath.Join(t.TempDir(), "secret.txt")
+	require.NoError(t, os.WriteFile(secret, []byte("operator-local-secret\n"), 0o600))
+
+	names := stagedShipcheckReportNames()
+	require.GreaterOrEqual(t, len(names), 2)
+
+	if err := os.Symlink(secret, filepath.Join(stashed, names[0])); err != nil {
+		t.Skipf("cannot create symlink in this environment: %v", err)
+	}
+	require.NoError(t, os.Mkdir(filepath.Join(stashed, names[1]), 0o755))
+
+	require.NoError(t, restoreStashedShipcheckReports(outDir, []stashedDir{{stashed: stashed}}))
+
+	for _, name := range names {
+		_, err := os.Lstat(filepath.Join(outDir, name))
+		assert.ErrorIs(t, err, os.ErrNotExist, "must not restore non-regular shipcheck report %s", name)
+	}
+}
+
 func TestPublishPackageDestIgnoresManuscriptsDivergence(t *testing.T) {
 	home := setLibraryTestEnv(t)
 	cliDir := filepath.Join(home, "library", "test-pp-cli")
@@ -2416,21 +2577,53 @@ func TestCheckModulePath(t *testing.T) {
 	t.Run("canonical prefix passes", func(t *testing.T) {
 		require.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"),
 			[]byte("module github.com/mvanhorn/printing-press-library/library/ai/exa\n\ngo 1.26.6\n"), 0o644))
-		res := checkModulePath(dir)
+		res := checkModulePath(dir, "")
 		assert.True(t, res.Passed, res.Error)
 		assert.Equal(t, "module path", res.Name)
+	})
+
+	t.Run("canonical prefix passes when requested explicitly", func(t *testing.T) {
+		const canonical = "github.com/mvanhorn/printing-press-library/library/ai/exa"
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"),
+			[]byte("module "+canonical+"\n\ngo 1.26.6\n"), 0o644))
+		res := checkModulePath(dir, canonical)
+		assert.True(t, res.Passed, res.Error)
+	})
+
+	t.Run("custom requested path passes when go.mod matches", func(t *testing.T) {
+		const custom = "github.com/acme/my-library/library/ai/exa"
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"),
+			[]byte("module "+custom+"\n\ngo 1.26.6\n"), 0o644))
+		res := checkModulePath(dir, custom)
+		assert.True(t, res.Passed, res.Error)
+	})
+
+	t.Run("declared path that differs from the requested path fails", func(t *testing.T) {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"),
+			[]byte("module github.com/acme/my-library/library/ai/exa\n\ngo 1.26.6\n"), 0o644))
+		res := checkModulePath(dir, "github.com/acme/my-library/library/ai/other")
+		assert.False(t, res.Passed)
+		assert.Contains(t, res.Error, "does not match the requested --module-path")
 	})
 
 	t.Run("bare CLI name fails", func(t *testing.T) {
 		require.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"),
 			[]byte("module exa-pp-cli\n\ngo 1.26.6\n"), 0o644))
-		res := checkModulePath(dir)
+		res := checkModulePath(dir, "")
 		assert.False(t, res.Passed)
 		assert.Contains(t, res.Error, "does not start with the canonical library prefix")
 	})
 
+	t.Run("bare CLI name fails even when requested explicitly", func(t *testing.T) {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"),
+			[]byte("module exa-pp-cli\n\ngo 1.26.6\n"), 0o644))
+		res := checkModulePath(dir, "exa-pp-cli")
+		assert.False(t, res.Passed)
+		assert.Contains(t, res.Error, "is a bare CLI name")
+	})
+
 	t.Run("missing go.mod fails", func(t *testing.T) {
-		res := checkModulePath(filepath.Join(t.TempDir(), "nope"))
+		res := checkModulePath(filepath.Join(t.TempDir(), "nope"), "")
 		assert.False(t, res.Passed)
 		assert.Contains(t, res.Error, "go.mod not found")
 	})
@@ -2438,7 +2631,7 @@ func TestCheckModulePath(t *testing.T) {
 	t.Run("no module line fails", func(t *testing.T) {
 		emptyDir := t.TempDir()
 		require.NoError(t, os.WriteFile(filepath.Join(emptyDir, "go.mod"), []byte("go 1.26.6\n"), 0o644))
-		res := checkModulePath(emptyDir)
+		res := checkModulePath(emptyDir, "")
 		assert.False(t, res.Passed)
 		assert.Contains(t, res.Error, "declares no module line")
 	})
@@ -2477,4 +2670,42 @@ func TestPublishValidateModulePathCheckWired(t *testing.T) {
 	// authoritative failure lives in the package flow's staged-tree check.
 	assert.NotEmpty(t, modulePathCheck.Warning)
 	assert.Contains(t, modulePathCheck.Warning, "canonical library prefix")
+}
+
+func TestPublishPackageHonorsCustomModulePath(t *testing.T) {
+	home := setLibraryTestEnv(t)
+	cliDir := filepath.Join(home, "library", "test-pp-cli")
+	writePublishableTestCLI(t, cliDir)
+	stubPublishPackageValidation(t)
+
+	const custom = "github.com/acme/my-library/library/other/test"
+	target := filepath.Join(t.TempDir(), "staging")
+	cmd := newPublishCmd()
+	cmd.SetArgs([]string{"package", "--dir", cliDir, "--category", "other", "--target", target, "--module-path", custom, "--json"})
+
+	output, err := runWithCapturedStdout(t, cmd.Execute)
+	require.NoError(t, err, "a custom --module-path must not be rejected by the module-path check")
+
+	var result PackageResult
+	require.NoError(t, json.Unmarshal([]byte(output), &result))
+	assert.Equal(t, custom, result.ModulePath)
+
+	staged, err := os.ReadFile(filepath.Join(result.StagedDir, "go.mod"))
+	require.NoError(t, err)
+	assert.Contains(t, string(staged), "module "+custom)
+}
+
+func TestPublishPackageRejectsBareModulePathRequest(t *testing.T) {
+	home := setLibraryTestEnv(t)
+	cliDir := filepath.Join(home, "library", "test-pp-cli")
+	writePublishableTestCLI(t, cliDir)
+	stubPublishPackageValidation(t)
+
+	target := filepath.Join(t.TempDir(), "staging")
+	cmd := newPublishCmd()
+	cmd.SetArgs([]string{"package", "--dir", cliDir, "--category", "other", "--target", target, "--module-path", "test-pp-cli", "--json"})
+
+	err := cmd.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "is a bare CLI name")
 }
