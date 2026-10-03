@@ -7,8 +7,9 @@
 {{- $hasQueryFlags := endpointHasQueryFlags .Endpoint}}
 {{- $method := upper .Endpoint.Method}}
 {{- $deleteBodyWithoutParams := and (eq $method "DELETE") $hasJSONBody (not (endpointHasRequestParams .Endpoint))}}
-{{- $isReadVerb := or (eq $method "GET") (eq $method "HEAD") (eq $method "OPTIONS")}}
 {{- $isWriteVerb := or (eq $method "POST") (eq $method "PUT") (eq $method "PATCH")}}
+{{- /* Same gate as command_endpoint.go.tmpl $isMutationOutput. */}}
+{{- $isMutationOutput := and (not .IsReadOnly) (not (or (eq $method "GET") (eq $method "HEAD")))}}
 {{- $canWriteBack := and .HasStore $isWriteVerb (not .IsReadOnly) (not .Endpoint.UsesBinaryResponse) (not .Endpoint.UsesTextResponse)}}
 {{- $supportsAllPagination := and (ne .Endpoint.Pagination nil) (ne .Endpoint.Pagination.Type "id_walk") (eq $method "GET") .IsReadOnly}}
 {{- $dataSourceStrategy := dataSourceStrategy .Resource .Endpoint}}
@@ -74,9 +75,7 @@ func new{{cmdIdent .PromotedName}}PromotedCmd(flags *rootFlags) *cobra.Command {
 {{- if $example}}
 		Example: {{printf "%q" $example}},
 {{- end}}
-{{- if not (positionalArgs .Endpoint)}}
-		Args: cobra.NoArgs,
-{{- end}}
+		Args: {{endpointArgsExpr .Endpoint}},
 		Annotations: map[string]string{ {{- if not .APISpec.IsLocalSQLiteSource}}"pp:endpoint": {{printf "%q" (printf "%s.%s" .ResourceName .EndpointName)}}, {{end}}"pp:method": {{printf "%q" (upper .Endpoint.Method)}}, "pp:path": {{printf "%q" .EffectivePath}}{{if .IsReadOnly}}, "mcp:read-only": "true"{{end}}{{if endpointHasRequiredInput .Endpoint}}, "pp:requires-input": "true"{{end}}{{if endpointSkipsErrorPathProbe .Endpoint}}, "pp:no-error-path-probe": "true"{{end}}{{if $happyArgs}}, "pp:happy-args": {{printf "%q" $happyArgs}}{{end}}{{if .Endpoint.HappyStdin}}, "pp:happy-stdin": {{printf "%q" .Endpoint.HappyStdin}}{{end}}{{if .Endpoint.LiveDogfoodRequiresTier}}, "pp:requires-tier": {{printf "%q" .Endpoint.LiveDogfoodRequiresTier}}{{end}}{{if .Endpoint.Deprecated}}, "pp:deprecated": "true"{{end}}},
 		RunE: func(cmd *cobra.Command, args []string) error {
 {{- if endpointHasRequiredInput .Endpoint}}
@@ -219,7 +218,7 @@ func new{{cmdIdent .PromotedName}}PromotedCmd(flags *rootFlags) *cobra.Command {
 			htmlRequestParams["{{paramWireName .}}"] = args[{{positionalIndex $.Endpoint .Name}}]
 {{- end}}
 {{- if and (not .Positional) (not .PathParam) (not (paramIsHeader .)) (not (isArrayQueryParam .)) (not (isDeepObjectQueryParam .))}}
-				if {{readParamPresenceExpr .}} {
+				if {{paramPresenceExpr .}} {
 					htmlRequestParams["{{paramWireName .}}"] = formatCLIParamValue(flag{{camel (paramIdent .)}})
 				}
 {{- end}}
@@ -299,7 +298,7 @@ func new{{cmdIdent .PromotedName}}PromotedCmd(flags *rootFlags) *cobra.Command {
 			params["{{paramWireName .}}"] = args[{{positionalIndex $.Endpoint .Name}}]
 {{- end}}
 {{- if and (not .Positional) (not .PathParam) (not (paramIsHeader .)) (not (isArrayQueryParam .)) (not (isDeepObjectQueryParam .))}}
-			if {{if $isReadVerb}}{{readParamPresenceExpr .}}{{else}}{{paramPresenceExpr .}}{{end}} {
+			if {{paramPresenceExpr .}} {
 				params["{{paramWireName .}}"] = formatCLIParamValue(flag{{camel (paramIdent .)}})
 			}
 {{- end}}
@@ -607,6 +606,17 @@ func new{{cmdIdent .PromotedName}}PromotedCmd(flags *rootFlags) *cobra.Command {
 				if wrapErr != nil {
 					return wrapErr
 				}
+{{- if $isMutationOutput}}
+				// Stamp after provenance and platform wrapping so those wrappers
+				// cannot hide dry_run and action under results.
+				if flags.dryRun {
+					stamped, stampErr := stampDryRunEnvelope(wrapped, "{{lower .Endpoint.Method}}")
+					if stampErr != nil {
+						return stampErr
+					}
+					wrapped = stamped
+				}
+{{- end}}
 				if err := printOutput(cmd.OutOrStdout(), wrapped, true); err != nil {
 					return err
 				}
@@ -625,6 +635,16 @@ func new{{cmdIdent .PromotedName}}PromotedCmd(flags *rootFlags) *cobra.Command {
 					return nil
 				}
 			}
+{{- if and $isMutationOutput (not .HasStore)}}
+			// --agent, --select, and --compact run inside the formatter. Stamping
+			// first lets that wrapper hide dry_run and action under results.
+			// The outer format checks keep --csv/--plain/--quiet out of the
+			// JSON stamper even when --json is also set; the inner clause is
+			// the shared piped-output escape hatch.
+			if flags.dryRun && !flags.csv && !flags.plain && !flags.quiet && (flags.asJSON || (!isTerminal(cmd.OutOrStdout()) && !flags.csv && !flags.quiet && !flags.plain)) {
+				return printStampedDryRunOutput(cmd.OutOrStdout(), data, flags, map[string]any{"source": "live"}, "{{lower .Endpoint.Method}}", {{$documentedFields}})
+			}
+{{- end}}
 			formatData := data
 			if flags.csv || flags.plain {
 				formatData = outputData
@@ -637,12 +657,12 @@ func new{{cmdIdent .PromotedName}}PromotedCmd(flags *rootFlags) *cobra.Command {
 {{- range .Endpoint.Params}}
 {{- if not .Positional}}
 {{- $param := .}}
-	cmd.Flags().{{cobraFlagFuncForParamRequired .Name .Type .Required (hasDefault .)}}(&flag{{camel (paramIdent .)}}, "{{publicFlagName .}}", {{defaultValForParamRequired . .Required (hasDefault .)}}, "{{oneline .Description}}{{enumDescriptionHint .Enum}}")
+	cmd.Flags().{{cobraFlagFuncForParamRequired .Name .Type .Required (hasDefault .)}}(&flag{{camel (paramIdent .)}}, "{{publicFlagName .}}", {{defaultValForParamRequired . .Required (hasDefault .)}}, {{quotedFlagDescription (oneline .Description) (enumDescriptionHint .Enum) (serverDefaultHint .)}})
 {{- if isConstDefault .}}
 	_ = cmd.Flags().MarkHidden("{{publicFlagName .}}")
 {{- end}}
 {{- range publicFlagAliases $param}}
-	cmd.Flags().{{cobraFlagFuncForParamRequired $param.Name $param.Type $param.Required (hasDefault $param)}}(&flag{{camel (paramIdent $param)}}, "{{.}}", {{defaultValForParamRequired $param $param.Required (hasDefault $param)}}, "{{oneline $param.Description}}{{enumDescriptionHint $param.Enum}}")
+	cmd.Flags().{{cobraFlagFuncForParamRequired $param.Name $param.Type $param.Required (hasDefault $param)}}(&flag{{camel (paramIdent $param)}}, "{{.}}", {{defaultValForParamRequired $param $param.Required (hasDefault $param)}}, {{quotedFlagDescription (oneline $param.Description) (enumDescriptionHint $param.Enum) (serverDefaultHint $param)}})
 	_ = cmd.Flags().MarkHidden("{{.}}")
 {{- end}}
 {{- end}}

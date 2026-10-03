@@ -19,9 +19,12 @@ func newProjectsTasksListProjectCmd(flags *rootFlags) *cobra.Command {
 	var flagAll bool
 
 	cmd := &cobra.Command{
-		Use:         "list-project <projectId>",
-		Aliases:     []string{"get"},
-		Short:       "List project tasks",
+		Use:     "list-project <projectId>",
+		Aliases: []string{"get"},
+		Short:   "List project tasks",
+		Args: func(cmd *cobra.Command, args []string) error {
+			return endpointPositionalArgs(cmd, flags, args, cobra.MaximumNArgs(1))
+		},
 		Annotations: map[string]string{"pp:endpoint": "tasks.list-project", "pp:method": "GET", "pp:path": "/projects/{projectId}/tasks", "mcp:read-only": "true"},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if len(args) == 0 {
@@ -135,7 +138,7 @@ func newProjectsTasksListProjectCmd(flags *rootFlags) *cobra.Command {
 	}
 	cmd.Flags().StringVar(&flagXApiVersion, "x-api-version", "2026-04-01", "Required API version header.")
 	cmd.Flags().StringVar(&flagPriority, "priority", "", "Priority (one of: low, normal, high)")
-	cmd.Flags().IntVar(&flagLimit, "limit", 50, "Limit")
+	cmd.Flags().IntVar(&flagLimit, "limit", 0, "Limit (default: 50)")
 	cmd.Flags().StringVar(&flagCursor, "cursor", "", "Cursor")
 	cmd.Flags().BoolVar(&flagAll, "all", false, "Fetch all pages")
 
