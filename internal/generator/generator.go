@@ -3742,6 +3742,7 @@ func cobratreeWalkerTemplateFiles() map[string]string {
 	} {
 		files["cobratree/"+name+".tmpl"] = filepath.Join("internal", "mcp", "cobratree", name)
 	}
+	files["mcp_mirror_property_names_test.go.tmpl"] = filepath.Join("internal", "mcp", "mirror_property_names_test.go")
 	return files
 }
 
@@ -6839,7 +6840,7 @@ func resourcePathPageSize(data visionRenderData, endpoint spec.Endpoint) int {
 func resourceWritePathEntries(data visionRenderData) []resourcePathEntry {
 	entries := map[string]resourcePathEntry{}
 	for name, resource := range data.Resources {
-		endpoint, ok := resourceEndpointForMethod(resource, "POST")
+		endpoint, ok := resourceWriteEndpoint(resource)
 		if !ok {
 			continue
 		}
