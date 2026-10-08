@@ -130,15 +130,23 @@ type PlaybookEntry struct {
 }
 
 type Generator struct {
-	Spec               *spec.APISpec
-	OutputDir          string
+	Spec      *spec.APISpec
+	OutputDir string
+	// PreservedCLIDir is the tree generate --force moved aside before
+	// Generate. Preserved hooks are not in OutputDir yet, and the merge
+	// keeps the docs written from this scan.
+	PreservedCLIDir    string
 	VisionSet          VisionTemplateSet
 	visionCommandNames map[string]string
 	FixtureSet         *browsersniff.FixtureSet
 	TrafficAnalysis    *browsersniff.TrafficAnalysis
-	Sources            []ReadmeSource   // Ecosystem tools to credit in README
-	DiscoveryPages     []string         // Pages visited during browser-sniff discovery
-	NovelFeatures      []NovelFeature   // Transcendence features for README/SKILL
+	Sources            []ReadmeSource // Ecosystem tools to credit in README
+	DiscoveryPages     []string       // Pages visited during browser-sniff discovery
+	NovelFeatures      []NovelFeature // Transcendence features for README/SKILL
+	// ListedAlternatives is true when research listed another tool for this
+	// API, including entries with no URL. SourcesForREADME drops those, so
+	// the flag is the exclusivity signal rather than len(Sources).
+	ListedAlternatives bool
 	Narrative          *ReadmeNarrative // LLM-authored prose for README/SKILL; optional
 	// Partial regeneration must retain generated intent wiring because the
 	// narrative source used to lift recipe intents is no longer available.
@@ -687,6 +695,7 @@ func New(s *spec.APISpec, outputDir string) *Generator {
 		// grouping as broken. We canonicalize for bucketing but render the
 		// first-seen display form so the LLM's casing choice wins — it's
 		// usually the more legible one.
+		"novelExclusivityClaim": func() string { return NovelFeatureExclusivityClaim },
 		"groupNovelFeatures": func(features []NovelFeature) []novelFeatureGroup {
 			canonGroup := func(s string) string {
 				return strings.Join(strings.Fields(strings.ToLower(s)), " ")
@@ -886,6 +895,7 @@ type HelperFlags struct {
 	HasCreateCommands    bool // spec has POST/PUT/PATCH write endpoints → emit create retry helpers
 	HasRawRequest        bool // spec has non-JSON request bodies → emit raw file/stdin reader
 	HasPromotedMutations bool // promoted write commands stamp a dry-run envelope; omit the helper otherwise
+	HasNoStoreReadDryRun bool // no-store reads print a dry-run envelope; omit the helper otherwise
 }
 
 // computeHelperFlags scans the spec's resources to determine which helpers are needed.
@@ -1004,6 +1014,44 @@ func promotedCommandsIncludeMutation(apiSpec *spec.APISpec, commands []PromotedC
 	return false
 }
 
+// Endpoint files skip the read dry-run branch for DELETE; promoted files
+// include it for every read, including a read-only DELETE. OPTIONS endpoints
+// are not generated. The helper is omitted unless one of those call sites exists.
+func specEmitsReadDryRunBranch(apiSpec *spec.APISpec, promoted []PromotedCommand) bool {
+	if apiSpec == nil {
+		return false
+	}
+	shared := sharedGETRPCPaths(apiSpec.Resources)
+	for _, command := range promoted {
+		if command.Endpoint.Method == "DELETE" && endpointIsReadCommandShared(command.Endpoint, command.EndpointName, shared) {
+			return true
+		}
+	}
+	var walk func(spec.Resource) bool
+	walk = func(resource spec.Resource) bool {
+		for name, endpoint := range resource.Endpoints {
+			if strings.EqualFold(strings.TrimSpace(endpoint.Method), "OPTIONS") || endpoint.Method == "DELETE" {
+				continue
+			}
+			if endpointIsReadCommandShared(endpoint, name, shared) {
+				return true
+			}
+		}
+		for _, sub := range resource.SubResources {
+			if walk(sub) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, resource := range apiSpec.Resources {
+		if walk(resource) {
+			return true
+		}
+	}
+	return false
+}
+
 func promotedCommandCanDetectPartialFailure(command PromotedCommand, hasStore bool) bool {
 	if !hasStore || command.Endpoint.UsesBinaryResponse() || command.Endpoint.UsesTextResponse() || endpointIsReadCommand(command.Endpoint, command.EndpointName) {
 		return false
@@ -1030,7 +1078,8 @@ func isMutationMethod(method string) bool {
 type helpersTemplateData struct {
 	*spec.APISpec
 	HelperFlags
-	HasAuthCommand bool
+	HasAuthCommand   bool
+	EmitsStdinSecret bool
 }
 
 // doctorTemplateData wraps APISpec with flags for store-aware credential
@@ -1138,13 +1187,18 @@ type readmeTemplateData struct {
 	// command emission. Distinct from HasAuth: an empty auth type still emits
 	// the auth surface, and docs must follow the emitted surface, not the
 	// spec's declared type.
-	HasAuthCommand       bool
-	HasPartialFailureErr bool
-	HasAutoRefresh       bool
-	SelectExample        string
-	SyncResourcesExample string
-	FreshnessCommands    []string
-	TrafficAnalysis      *trafficAnalysisTemplateData
+	HasAuthCommand bool
+	// HasListedAlternatives suppresses the "no other tool" claim when
+	// research or Sources names another tool for this API.
+	HasListedAlternatives   bool
+	AdditionalCommandGroups []listedDocCommandGroup
+	ReferenceCommandGroups  []listedDocCommandGroup
+	HasPartialFailureErr    bool
+	HasAutoRefresh          bool
+	SelectExample           string
+	SyncResourcesExample    string
+	FreshnessCommands       []string
+	TrafficAnalysis         *trafficAnalysisTemplateData
 	// PromotedResourceNames maps a resource name to true when the generator
 	// collapsed that single-endpoint resource into a leaf command. Templates
 	// (notably skill.md.tmpl's Command Reference) use this to emit `<cli>
@@ -1205,31 +1259,34 @@ func (g *Generator) readmeData() *readmeTemplateData {
 	helperFlags := computeHelperFlags(g.Spec)
 	applyPartialFailureFlags(&helperFlags, g.Spec, g.PromotedCommands, g.PromotedEndpointNames, g.hasDataLayer())
 	return &readmeTemplateData{
-		APISpec:               g.Spec,
-		Sources:               g.Sources,
-		DiscoveryPages:        g.DiscoveryPages,
-		NovelFeatures:         g.NovelFeatures,
-		Narrative:             g.Narrative,
-		ProseName:             g.proseName(),
-		CompactDescription:    g.compactDescription(),
-		SkillDescription:      g.skillDescription(),
-		HasDataLayer:          g.hasDataLayer(),
-		HasSync:               g.hasGeneratedSyncImplementation(),
-		HasAsyncJobs:          len(g.AsyncJobs) > 0,
-		HasWriteCommands:      hasWriteCommands(g.Spec.Resources),
-		HasCreateCommands:     hasCreateCommands(g.Spec.Resources),
-		HasDelete:             helperFlags.HasDelete,
-		HasAuth:               hasAuth(g.Spec.Auth),
-		HasAuthCommand:        g.shouldEmitAuth(),
-		HasPartialFailureErr:  helperFlags.HasPartialFailureErr,
-		HasAutoRefresh:        g.hasAutoRefresh(),
-		SelectExample:         selectExampleForCommand(g.Spec),
-		SyncResourcesExample:  syncResourcesExample(syncable, dependent),
-		FreshnessCommands:     g.freshnessCommandPaths(),
-		TrafficAnalysis:       g.trafficAnalysisData(),
-		PromotedResourceNames: g.PromotedResourceNames,
-		PromotedEndpointNames: g.PromotedEndpointNames,
-		WhichIndex:            g.whichIndexEntries(),
+		APISpec:                 g.Spec,
+		Sources:                 g.Sources,
+		DiscoveryPages:          g.DiscoveryPages,
+		NovelFeatures:           g.NovelFeatures,
+		Narrative:               g.Narrative,
+		ProseName:               g.proseName(),
+		CompactDescription:      g.compactDescription(),
+		SkillDescription:        g.skillDescription(),
+		HasDataLayer:            g.hasDataLayer(),
+		HasSync:                 g.hasGeneratedSyncImplementation(),
+		HasAsyncJobs:            len(g.AsyncJobs) > 0,
+		HasWriteCommands:        hasWriteCommands(g.Spec.Resources),
+		HasCreateCommands:       hasCreateCommands(g.Spec.Resources),
+		HasDelete:               helperFlags.HasDelete,
+		HasAuth:                 hasAuth(g.Spec.Auth),
+		HasAuthCommand:          g.shouldEmitAuth(),
+		HasListedAlternatives:   g.ListedAlternatives || len(g.Sources) > 0,
+		AdditionalCommandGroups: g.additionalCommandGroups(),
+		ReferenceCommandGroups:  g.referenceCommandGroups(),
+		HasPartialFailureErr:    helperFlags.HasPartialFailureErr,
+		HasAutoRefresh:          g.hasAutoRefresh(),
+		SelectExample:           selectExampleForCommand(g.Spec),
+		SyncResourcesExample:    syncResourcesExample(syncable, dependent),
+		FreshnessCommands:       g.freshnessCommandPaths(),
+		TrafficAnalysis:         g.trafficAnalysisData(),
+		PromotedResourceNames:   g.PromotedResourceNames,
+		PromotedEndpointNames:   g.PromotedEndpointNames,
+		WhichIndex:              g.whichIndexEntries(),
 	}
 }
 
@@ -2919,10 +2976,12 @@ func (g *Generator) renderSingleFiles() error {
 			hFlags.HasSyncHelpers = g.hasGeneratedSyncImplementation()
 			hFlags.HasResponseUnwrap = g.hasDataLayer() && promotedCommandsCanUnwrapResponse(g.PromotedCommands, g.Spec.Types)
 			hFlags.HasPromotedMutations = promotedCommandsIncludeMutation(g.Spec, g.PromotedCommands)
+			hFlags.HasNoStoreReadDryRun = !g.hasDataLayer() && specEmitsReadDryRunBranch(g.Spec, g.PromotedCommands)
 			data = &helpersTemplateData{
-				APISpec:        g.Spec,
-				HelperFlags:    hFlags,
-				HasAuthCommand: g.shouldEmitAuth(),
+				APISpec:          g.Spec,
+				HelperFlags:      hFlags,
+				HasAuthCommand:   g.shouldEmitAuth(),
+				EmitsStdinSecret: g.emitsStdinSecretReader(),
 			}
 		case "root_test.go.tmpl":
 			data = &rootTestTemplateData{
@@ -4261,21 +4320,7 @@ func (g *Generator) renderAuthFiles() error {
 	//   4. Browser-cookie / composed / persisted-query
 	//   5. Simple token-management (catch-all)
 	authPath := filepath.Join("internal", "cli", "auth.go")
-	authTmpl := "auth_simple.go.tmpl"
-	switch {
-	case g.Spec.Auth.EffectiveOAuth2Grant() == spec.OAuth2GrantClientCredentials && g.Spec.Auth.TokenURL != "":
-		authTmpl = "auth_client_credentials.go.tmpl"
-	case g.Spec.Auth.EffectiveOAuth2Grant() == spec.OAuth2GrantDeviceCode && g.Spec.Auth.DeviceAuthorizationURL != "" && g.Spec.Auth.TokenURL != "":
-		authTmpl = "auth_device_code.go.tmpl"
-	case g.Spec.Auth.AuthorizationURL != "":
-		authTmpl = "auth.go.tmpl"
-	case g.Spec.Auth.Type == "cookie" || g.Spec.Auth.Type == "composed" || g.hasTrafficAnalysisHint("graphql_persisted_query") || g.Spec.Auth.Subtype == spec.AuthSubtypeAuth0SPAInMemory:
-		// Browser-aware auth template for browser-cookie auth, a
-		// persisted-query registry, or an Auth0-SPA-in-memory bearer token
-		// (CDP runtime extraction). Query refresh flows need temporary
-		// browser capture support, not a resident browser transport.
-		authTmpl = "auth_browser.go.tmpl"
-	}
+	authTmpl := g.authTemplateName()
 	authData := &authTemplateData{
 		APISpec:                    g.Spec,
 		HasGraphQLPersistedQueries: g.hasTrafficAnalysisHint("graphql_persisted_query"),
@@ -4305,6 +4350,42 @@ func (g *Generator) renderAuthFiles() error {
 	}
 
 	return nil
+}
+
+// authTemplateName is the auth file renderAuthFiles writes. emitsStdinSecretReader
+// switches on the same name: a mismatch either calls readSecretFromStdin without
+// defining it or leaves the helper unused.
+func (g *Generator) authTemplateName() string {
+	switch {
+	case g.Spec.Auth.EffectiveOAuth2Grant() == spec.OAuth2GrantClientCredentials && g.Spec.Auth.TokenURL != "":
+		return "auth_client_credentials.go.tmpl"
+	case g.Spec.Auth.EffectiveOAuth2Grant() == spec.OAuth2GrantDeviceCode && g.Spec.Auth.DeviceAuthorizationURL != "" && g.Spec.Auth.TokenURL != "":
+		return "auth_device_code.go.tmpl"
+	case g.Spec.Auth.AuthorizationURL != "":
+		return "auth.go.tmpl"
+	case g.Spec.Auth.Type == "cookie" || g.Spec.Auth.Type == "composed" || g.hasTrafficAnalysisHint("graphql_persisted_query") || g.Spec.Auth.Subtype == spec.AuthSubtypeAuth0SPAInMemory:
+		return "auth_browser.go.tmpl"
+	default:
+		return "auth_simple.go.tmpl"
+	}
+}
+
+func (g *Generator) emitsStdinSecretReader() bool {
+	if g == nil || g.Spec == nil || !g.shouldEmitAuth() {
+		return false
+	}
+	switch g.authTemplateName() {
+	case "auth_client_credentials.go.tmpl", "auth_device_code.go.tmpl":
+		return true
+	case "auth_browser.go.tmpl":
+		// The browser template gates set-token on Auth.Type != "none".
+		// An empty type is not "none", so it still reads the secret.
+		return g.Spec.Auth.Type != "none"
+	case "auth_simple.go.tmpl":
+		return authSetTokenAvailable(g.Spec.Auth)
+	default:
+		return false
+	}
 }
 
 // shouldEmitAuth reports whether the generator should emit internal/cli/auth.go
