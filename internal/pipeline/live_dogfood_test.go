@@ -3470,7 +3470,7 @@ func TestFinalizeLiveDogfoodCoverageReportsHollowNovelFeatures(t *testing.T) {
 		},
 	}
 
-	finalizeLiveDogfoodCoverage(report, researchDir)
+	finalizeLiveDogfoodCoverage(report, researchDir, liveDogfoodProofContext{})
 
 	assert.True(t, report.CoverageHollow)
 	assert.Equal(t, []string{"digest"}, report.HollowFeatures)
@@ -3489,7 +3489,7 @@ func TestFinalizeLiveDogfoodCoverageDoesNotCountDryRunAsExecution(t *testing.T) 
 		},
 	}
 
-	finalizeLiveDogfoodCoverage(report, researchDir)
+	finalizeLiveDogfoodCoverage(report, researchDir, liveDogfoodProofContext{})
 
 	assert.True(t, report.CoverageHollow)
 	assert.Equal(t, []string{"digest"}, report.HollowFeatures)
@@ -3508,7 +3508,7 @@ func TestFinalizeLiveDogfoodCoverageRecognizesLiveNovelFeatureExecution(t *testi
 		},
 	}
 
-	finalizeLiveDogfoodCoverage(report, researchDir)
+	finalizeLiveDogfoodCoverage(report, researchDir, liveDogfoodProofContext{})
 
 	assert.False(t, report.CoverageHollow)
 	assert.Empty(t, report.HollowFeatures)
@@ -7121,7 +7121,7 @@ Examples:
 	args, ok = liveDogfoodHappyArgs(syntheticFlagCmd)
 	require.True(t, ok)
 	assert.Equal(t, []string{"users", "get-by-ids", "--ids", "example-value", "--format=json"}, args)
-	assert.Equal(t, reasonRequiredParamFixture, happyPathSyntheticParamFixtureSkip(syntheticFlagCmd, args),
+	assert.Equal(t, reasonRequiredParamFixture, happyPathSyntheticParamFixtureSkip(syntheticFlagCmd, args, parseHappyArgsAnnotation(syntheticFlagCmd.Annotations[happyArgsAnnotation]), false),
 		"flag-only pp:happy-args must still skip unresolved synthetic ID fixtures")
 
 	boolFlagCmd := liveDogfoodCommand{

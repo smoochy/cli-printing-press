@@ -56,6 +56,9 @@ Generated endpoint-mirror commands also gate mutating HTTP verbs (DELETE/POST/PU
 ### Long-running commands under live-dogfood
 Hand-written novel commands whose happy path is an expensive read/network operation (full sync loops, content crawlers, bulk archive walks) MUST curtail work when `cliutil.IsDogfoodEnv()` returns true. The `cli-printing-press dogfood --live` runner sets `PRINTING_PRESS_DOGFOOD=1` in every subprocess under a flat 30s per-command timeout, so an uncapped happy path trips the matrix verdict to FAIL. Unlike `IsAnyHarness`, this does NOT mean "don't hit the network" — dogfood is a real-API matrix for reads; use it to bound read work (paginate once, fetch a bounded sample, honor a smaller `--limit` default), never to substitute mock data for real calls.
 
+### Preview happy path under live-dogfood
+Annotate a mutating novel command `cmd.Annotations["pp:preview-happy-path"] = "true"` only when running it without `--dry-run` and without its confirm flag performs no external write (it prints a preview). `dogfood --live` then runs its happy path for real from a scratch directory without `--allow-destructive`, and that pass clears hollow coverage. `pp:happy-args` for such a command must not carry a confirm flag (`--yes`, `-y`, `--confirm`, `--force`, `--execute`, `--apply`, `--send`, `--launch`); the runner fails the row if it does. Destructive-at-auth commands stay skipped. Commands whose happy path actually writes keep `pp:live-happy-path` plus `--allow-destructive`.
+
 ### Generator-reserved namespaces
 `internal/cliutil/`, `internal/learn/`, and `internal/mcp/cobratree/` are generator-owned packages emitted into every printed CLI. Do not hand-author code in them and do not name agent-authored helpers that collide with their exports — regen will overwrite the work. Novel-feature code goes in command packages and may import from `cliutil` or `learn`.
 
@@ -63,6 +66,9 @@ The `internal/learn` templates under `internal/generator/templates/learn**` must
 
 ### Typed exit-code verification
 `cli-printing-press verify` treats exit `0` as success by default. For commands where a non-zero code is intentional control flow, declare it in Cobra with `Annotations: map[string]string{"pp:typed-exit-codes": "0,2"}`. The verifier reads that annotation first, then falls back to a command-level `Exit codes:` help block. Do not put the whole global failure palette in a command-level help block unless those codes should count as verify-pass for that specific command.
+
+### Proof-backed novel-feature coverage
+Use `cmd.Annotations["pp:verified-by-proof"] = "<file>.md"` only for a state-dependent novel command whose real happy path needs state a prior real write created (for example `<cmd> <batch-id>` on a batch that exists), so live dogfood can never pass it without `--dry-run`. It is not a substitute for a runnable happy path. The value is a bare `.md` or `.txt` filename (no separators, no `..`) in the same proofs directory as `--write-acceptance`. `dogfood --live` counts the feature as covered only when the file is non-empty, mentions the command path, and this run passed the command's help plus a dry-run `happy_path` or `dry_run_json` check; otherwise it stays in `hollow_features`. Accepted features are listed in `proof_covered_features` on the report and `phase5-acceptance.json`, and the phase5 gate fails when a listed proof file is missing beside the marker.
 
 ## Build, Test & Lint
 ```bash
