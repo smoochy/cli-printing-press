@@ -445,6 +445,7 @@ func New(s *spec.APISpec, outputDir string) *Generator {
 		"bodyHasStringBackedBool":             bodyHasStringBackedBool,
 		"multipartBodyMaps":                   multipartBodyMaps,
 		"endpointUsesMultipart":               endpointUsesMultipart,
+		"endpointHasJSONBody":                 endpointHasJSONBody,
 		"endpointReplaySafe":                  endpointReplaySafe,
 		"endpointUsesRawRequest":              endpointUsesRawRequest,
 		"endpointUsesCSVArray":                endpointUsesCSVArray,
@@ -478,6 +479,8 @@ func New(s *spec.APISpec, outputDir string) *Generator {
 		"mcpParamBindings":             mcpParamBindings,
 		"mcpEndpointPageable":          mcpEndpointPageable,
 		"mcpPageConfig":                mcpPageConfig,
+		"mcpToolPageConfig":            mcpToolPageConfig,
+		"mcpExposeOpaqueCursor":        mcpExposeOpaqueCursor,
 		"mcpGlobalTemplateInputParams": mcpGlobalTemplateInputParams,
 		"mcpGlobalTemplateBindings":    mcpGlobalTemplateBindings,
 		// endpointNeedsClientLimit reports whether a list endpoint needs
@@ -7435,18 +7438,7 @@ func mcpEndpointPageable(endpoint spec.Endpoint) bool {
 }
 
 func mcpPageConfig(endpoint spec.Endpoint) string {
-	if !mcpEndpointPageable(endpoint) {
-		return "mcpPageConfig{}"
-	}
-	nextCursorPath := endpoint.Pagination.NextCursorPath
-	paginationType := strings.ToLower(strings.TrimSpace(endpoint.Pagination.Type))
-	if strings.TrimSpace(nextCursorPath) == "" && paginationType != "offset" && paginationType != "page" {
-		nextCursorPath = endpoint.Pagination.CursorParam
-	}
-	return fmt.Sprintf("mcpPageConfig{CursorParam: %q, NextCursorPath: %q}",
-		endpoint.Pagination.CursorParam,
-		nextCursorPath,
-	)
+	return mcpToolPageConfig(spec.Resource{}, "", endpoint)
 }
 
 func isMCPPaginationCursorParam(endpoint spec.Endpoint, p spec.Param) bool {
@@ -8968,6 +8960,19 @@ func hasMultipartRequest(apiSpec *spec.APISpec) bool {
 
 func endpointUsesForm(endpoint spec.Endpoint) bool {
 	return strings.EqualFold(strings.TrimSpace(endpoint.RequestContentType), "application/x-www-form-urlencoded")
+}
+
+func endpointHasJSONBody(endpoint spec.Endpoint) bool {
+	if len(endpoint.Body) > 0 || endpoint.BodyJSONFallback {
+		return !endpointUsesMultipart(endpoint) && !endpointUsesForm(endpoint)
+	}
+	if !endpoint.BodyRequired {
+		return false
+	}
+	contentType, _, _ := strings.Cut(endpoint.RequestContentType, ";")
+	endpoint.RequestContentType = strings.TrimSpace(contentType)
+	return endpoint.RequestContentType != "" &&
+		!endpointUsesMultipart(endpoint) && !endpointUsesForm(endpoint) && !endpointUsesRawRequest(endpoint)
 }
 
 func hasFormRequest(apiSpec *spec.APISpec) bool {
