@@ -84,6 +84,8 @@ func TestGenerateProjectsCompile(t *testing.T) {
 		"internal/cliutil/duration_test.go",
 		"internal/cliutil/odata_date.go",
 		"internal/cliutil/odata_date_test.go",
+		"internal/cliutil/query.go",
+		"internal/cliutil/query_test.go",
 		"internal/cliutil/cliutil_test.go",
 		"internal/client/client.go",
 		"internal/client/client_test.go",
@@ -161,9 +163,12 @@ func TestGenerateProjectsCompile(t *testing.T) {
 		// +1: internal/cli/export_perms_test.go when export is emitted.
 		// +1: internal/mcp/mirror_property_names_test.go, the root-command
 		// property-name grammar check for cobratree mirrors.
-		{name: "stytch", specPath: filepath.Join("..", "..", "testdata", "stytch.yaml"), expectedFiles: 181},
-		{name: "clerk", specPath: filepath.Join("..", "..", "testdata", "clerk.yaml"), expectedFiles: 185},
-		{name: "loops", specPath: filepath.Join("..", "..", "testdata", "loops.yaml"), expectedFiles: 182},
+		// +4: store_adopt_{linux,darwin,windows,other}.go. Not always-emitted:
+		// only a local store plus credential auth. All three fixtures qualify.
+		// +2: cliutil.EncodeQuery and its test.
+		{name: "stytch", specPath: filepath.Join("..", "..", "testdata", "stytch.yaml"), expectedFiles: 187},
+		{name: "clerk", specPath: filepath.Join("..", "..", "testdata", "clerk.yaml"), expectedFiles: 191},
+		{name: "loops", specPath: filepath.Join("..", "..", "testdata", "loops.yaml"), expectedFiles: 188},
 	}
 
 	for _, tt := range tests {
@@ -362,7 +367,7 @@ func TestGenerateCliutilPackage(t *testing.T) {
 
 	// All cliutil files must be emitted.
 	cliutilDir := filepath.Join(outputDir, "internal", "cliutil")
-	for _, name := range []string{"fanout.go", "text.go", "extractnumber.go", "extractnumber_test.go", "cliutil_test.go", "filelock.go", "filelock_unix.go", "filelock_windows.go", "filelock_test.go"} {
+	for _, name := range []string{"fanout.go", "text.go", "extractnumber.go", "extractnumber_test.go", "cliutil_test.go", "query.go", "query_test.go", "filelock.go", "filelock_unix.go", "filelock_windows.go", "filelock_test.go"} {
 		_, err := os.Stat(filepath.Join(cliutilDir, name))
 		require.NoError(t, err, "expected %s to be emitted", name)
 	}
@@ -385,6 +390,7 @@ func TestGenerateCliutilPackage(t *testing.T) {
 		{"extractnumber.go", "func ExtractInt("},
 		{"jwtshape.go", "func LooksLikeJWT("},
 		{"jwtshape.go", "func FindJWTInCookieJar("},
+		{"query.go", "func EncodeQuery("},
 		{"filelock.go", "func WithFileLock("},
 		{"filelock.go", "func TryWithFileLock("},
 		{"filelock_unix.go", "syscall.LOCK_NB"},
@@ -8267,6 +8273,256 @@ func TestPrintJSONFilteredSelectOverridesCompact(t *testing.T) {
 	runGoCommand(t, outputDir, "test", "./internal/cli", "-run", "TestCompactFieldsKeepsFrequentNestedPayloads|TestPrintJSONFilteredSelectOverridesCompact", "-count=1")
 }
 
+// TestGeneratedCompactListFieldsPreservesPresenceMarkers pins that --compact
+// (and therefore --agent) keeps a key whose presence changes the row, on
+// both the frequency path and the schema-aware path. Four local rows plus
+// one inherited row must still show _inheritedFrom on that row, while
+// verbose fields and ordinary sparse fields stay dropped. revenue is on
+// every row and is not a gravity name: the frequency path keeps it and the
+// schema-aware path drops it, so a passing schema-aware case cannot be the
+// frequency path in disguise. A key stays only when every observed value is
+// marker-sized: mixed small and bulky values in both row orders drop it on
+// both paths, and objects of 8 and 9 keys pin the size limit.
+func TestGeneratedCompactListFieldsPreservesPresenceMarkers(t *testing.T) {
+	t.Parallel()
+
+	apiSpec := minimalSpec("compact-markers")
+	outputDir := filepath.Join(t.TempDir(), naming.CLI(apiSpec.Name))
+	require.NoError(t, New(apiSpec, outputDir).Generate())
+
+	runtimeTest := `package cli
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+)
+
+func TestCompactFieldsKeepsPresenceMarkers(t *testing.T) {
+	rows := []map[string]any{
+		{"id": "s1", "name": "Local A", "revenue": 1, "description": "verbose", "body": "verbose"},
+		{"id": "s2", "name": "Local B", "revenue": 2, "description": "verbose", "body": "verbose", "deprecated": true},
+		{
+			"id": "s3", "name": "Local C", "revenue": 3, "description": "verbose", "body": "verbose",
+			"note": "sparse text", "enabled": true, "isolated": true,
+			"_links": map[string]any{"self": "/s3"},
+			"_debug": strings.Repeat("x", compactMarkerMaxRunes+1),
+			"_note":  "line1\nline2",
+			"_blob":  map[string]any{"child": map[string]any{"id": "nested"}},
+			"_tags":  []any{"a"},
+		},
+		{"id": "s4", "name": "Local D", "revenue": 4, "description": "verbose", "body": "verbose", "override": false, "read_only": true},
+		{
+			"id": "s5", "name": "Inherited", "revenue": 5, "description": "verbose", "body": "verbose",
+			"_inheritedFrom": map[string]any{"id": "parent-1", "name": "Root"},
+			"locked": true, "inherited": true,
+		},
+	}
+	raw, err := json.Marshal(rows)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	gravityOnly := map[string]bool{
+		"id": true, "name": true, "revenue": true,
+		"description": true, "body": true, "note": true, "enabled": true, "isolated": true,
+		"_debug": true, "_note": true, "_blob": true, "_tags": true, "_links": true,
+	}
+	withMarkers := map[string]bool{
+		"id": true, "name": true, "revenue": true,
+		"description": true, "body": true, "note": true, "enabled": true, "isolated": true,
+		"_debug": true, "_note": true, "_blob": true, "_tags": true, "_links": true,
+		"_inheritedFrom": true, "locked": true, "inherited": true, "deprecated": true,
+		"override": true, "read_only": true,
+	}
+	cases := []struct {
+		name        string
+		documented  []map[string]bool
+		keepRevenue bool
+	}{
+		{name: "frequency", keepRevenue: true},
+		{name: "schema-aware gravity-only documented map", documented: []map[string]bool{gravityOnly}},
+		{name: "schema-aware documented markers", documented: []map[string]bool{withMarkers}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := compactFields(json.RawMessage(raw), tc.documented...)
+			decoded := decodePresenceRows(t, got)
+			if len(decoded) != 5 {
+				t.Fatalf("got %d rows, want 5: %s", len(decoded), got)
+			}
+			byID := map[string]map[string]any{}
+			for _, row := range decoded {
+				id, _ := row["id"].(string)
+				byID[id] = row
+			}
+			base := []string{"id", "name"}
+			if tc.keepRevenue {
+				base = append(base, "revenue")
+			}
+			assertPresenceKeys(t, byID["s1"], base...)
+			assertPresenceKeys(t, byID["s3"], base...)
+			assertPresenceKeys(t, byID["s2"], append(append([]string{}, base...), "deprecated")...)
+			assertPresenceKeys(t, byID["s4"], append(append([]string{}, base...), "override", "read_only")...)
+			assertPresenceKeys(t, byID["s5"], append(append([]string{}, base...), "_inheritedFrom", "locked", "inherited")...)
+			if byID["s2"]["deprecated"] != true {
+				t.Fatalf("deprecated = %#v", byID["s2"]["deprecated"])
+			}
+			if _, ok := byID["s4"]["override"]; !ok || byID["s4"]["override"] != false {
+				t.Fatalf("override = %#v, want false", byID["s4"]["override"])
+			}
+			if byID["s4"]["read_only"] != true || byID["s5"]["locked"] != true || byID["s5"]["inherited"] != true {
+				t.Fatalf("flag values drifted: s4=%#v s5=%#v", byID["s4"], byID["s5"])
+			}
+			parent, ok := byID["s5"]["_inheritedFrom"].(map[string]any)
+			if !ok || parent["id"] != "parent-1" || parent["name"] != "Root" {
+				t.Fatalf("_inheritedFrom = %#v", byID["s5"]["_inheritedFrom"])
+			}
+			if _, present := byID["s1"]["_inheritedFrom"]; present {
+				t.Fatalf("s1 gained _inheritedFrom: %#v", byID["s1"])
+			}
+		})
+	}
+}
+
+// One bulky value disqualifies the key. Filler rows keep it under the
+// frequency threshold, which drops to 1 on a 2-row list and would keep it anyway.
+func TestCompactFieldsRejectsBulkyPresenceMarkers(t *testing.T) {
+	small := map[string]any{"id": "parent-1", "name": "Root"}
+	eight := presenceMarkerObject(8)
+	nine := presenceMarkerObject(9)
+	bulky := strings.Repeat("x", compactMarkerMaxRunes+1)
+	plain := func(id string, revenue int) map[string]any {
+		return map[string]any{"id": id, "name": id, "revenue": revenue}
+	}
+	control := []map[string]any{
+		{"id": "a", "name": "A", "revenue": 1, "_provenance": small, "deprecated": true},
+		{"id": "b", "name": "B", "revenue": 2, "_provenance": small, "deprecated": false},
+		{"id": "c", "name": "C", "revenue": 3, "_bound": eight},
+		plain("d", 4),
+		{"id": "e", "name": "E", "revenue": 5, "_toobig": nine},
+	}
+	smallThenBulky := []map[string]any{
+		{"id": "a", "name": "A", "revenue": 1, "_provenance": eight, "deprecated": false},
+		{"id": "b", "name": "B", "revenue": 2, "_provenance": nine, "deprecated": bulky},
+		plain("c", 3),
+		plain("d", 4),
+		plain("e", 5),
+	}
+	bulkyThenSmall := []map[string]any{
+		{"id": "a", "name": "A", "revenue": 1, "_provenance": nine, "deprecated": bulky},
+		{"id": "b", "name": "B", "revenue": 2, "_provenance": eight, "deprecated": true},
+		plain("c", 3),
+		plain("d", 4),
+		plain("e", 5),
+	}
+	documented := map[string]bool{
+		"id": true, "name": true, "revenue": true,
+		"_provenance": true, "deprecated": true, "_bound": true, "_toobig": true,
+	}
+	cases := []struct {
+		name        string
+		rows        []map[string]any
+		documented  []map[string]bool
+		keepRevenue bool
+		keepMarkers bool
+	}{
+		{name: "frequency control", rows: control, keepRevenue: true, keepMarkers: true},
+		{name: "schema-aware control", rows: control, documented: []map[string]bool{documented}, keepMarkers: true},
+		{name: "frequency small then bulky", rows: smallThenBulky, keepRevenue: true},
+		{name: "schema-aware small then bulky", rows: smallThenBulky, documented: []map[string]bool{documented}},
+		{name: "frequency bulky then small", rows: bulkyThenSmall, keepRevenue: true},
+		{name: "schema-aware bulky then small", rows: bulkyThenSmall, documented: []map[string]bool{documented}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := json.Marshal(tc.rows)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			got := compactFields(json.RawMessage(raw), tc.documented...)
+			decoded := decodePresenceRows(t, got)
+			if len(decoded) != len(tc.rows) {
+				t.Fatalf("got %d rows, want %d: %s", len(decoded), len(tc.rows), got)
+			}
+			byID := map[string]map[string]any{}
+			for _, row := range decoded {
+				id, _ := row["id"].(string)
+				byID[id] = row
+			}
+			base := []string{"id", "name"}
+			if tc.keepRevenue {
+				base = append(base, "revenue")
+			}
+			if !tc.keepMarkers {
+				for _, id := range []string{"a", "b", "c", "d", "e"} {
+					assertPresenceKeys(t, byID[id], base...)
+				}
+				return
+			}
+			assertPresenceKeys(t, byID["a"], append(append([]string{}, base...), "_provenance", "deprecated")...)
+			assertPresenceKeys(t, byID["b"], append(append([]string{}, base...), "_provenance", "deprecated")...)
+			assertPresenceKeys(t, byID["c"], append(append([]string{}, base...), "_bound")...)
+			assertPresenceKeys(t, byID["d"], base...)
+			assertPresenceKeys(t, byID["e"], base...)
+			if byID["a"]["deprecated"] != true || byID["b"]["deprecated"] != false {
+				t.Fatalf("deprecated values drifted: a=%#v b=%#v", byID["a"]["deprecated"], byID["b"]["deprecated"])
+			}
+			bound, ok := byID["c"]["_bound"].(map[string]any)
+			if !ok || len(bound) != 8 {
+				t.Fatalf("_bound = %#v, want 8 scalar keys", byID["c"]["_bound"])
+			}
+			if _, present := byID["e"]["_toobig"]; present {
+				t.Fatalf("9-key object survived compaction: %#v", byID["e"])
+			}
+		})
+	}
+}
+
+func presenceMarkerObject(n int) map[string]any {
+	obj := make(map[string]any, n)
+	const keys = "abcdefghi"
+	for i := 0; i < n; i++ {
+		obj[keys[i:i+1]] = "v"
+	}
+	return obj
+}
+
+func decodePresenceRows(t *testing.T, raw json.RawMessage) []map[string]any {
+	t.Helper()
+	var rows []map[string]any
+	if err := json.Unmarshal(raw, &rows); err != nil {
+		t.Fatalf("compactFields returned invalid JSON: %v\n%s", err, raw)
+	}
+	return rows
+}
+
+func assertPresenceKeys(t *testing.T, row map[string]any, want ...string) {
+	t.Helper()
+	if row == nil {
+		t.Fatalf("missing row, want keys %v", want)
+	}
+	got := make(map[string]bool, len(row))
+	for key := range row {
+		got[key] = true
+	}
+	if len(got) != len(want) {
+		t.Fatalf("keys = %#v, want %v", row, want)
+	}
+	for _, key := range want {
+		if !got[key] {
+			t.Fatalf("keys = %#v, want %v", row, want)
+		}
+	}
+}
+`
+	testPath := filepath.Join(outputDir, "internal", "cli", "compact_presence_markers_test.go")
+	require.NoError(t, os.WriteFile(testPath, []byte(runtimeTest), 0o644))
+
+	requireGeneratedCompiles(t, outputDir)
+	runGoCommand(t, outputDir, "test", "./internal/cli", "-run", "TestCompactFieldsKeepsPresenceMarkers|TestCompactFieldsRejectsBulkyPresenceMarkers", "-count=1")
+}
+
 // matchClosingBrace walks s from start, finds the first `{`, then returns
 // the index of the matching `}` by counting depth. Returns -1 if either no
 // opening brace exists at/after start or the input is unbalanced.
@@ -12665,7 +12921,7 @@ func TestGeneratedHelpers_AuthWithKeyURL_Compiles(t *testing.T) {
 	clientSrc := readGeneratedFile(t, outputDir, "internal", "client", "client.go")
 	assert.Contains(t, clientSrc, "q := req.URL.Query()",
 		"query API-key auth must emit cross-host query cleanup")
-	assert.Contains(t, clientSrc, "req.URL.RawQuery = q.Encode()",
+	assert.Contains(t, clientSrc, "req.URL.RawQuery = cliutil.EncodeQuery(q)",
 		"query API-key auth must write the cleaned query back")
 	requireGeneratedCompiles(t, outputDir)
 }
@@ -20631,8 +20887,8 @@ func TestProjectManagementWorkflowsEmitSyncHints(t *testing.T) {
 		"analytics group-by JSON should encode missing values as null via any")
 	dataSourceSrc, err := os.ReadFile(filepath.Join(outputDir, "internal", "cli", "data_source.go"))
 	require.NoError(t, err)
-	assert.Contains(t, string(dataSourceSrc), `emitSyncHints(hintWriter, db, resourceType, flags.maxAge)`,
-		"data-source local fallback should emit sync hints for endpoint reads")
+	assert.Contains(t, string(dataSourceSrc), `emitSyncHints(hintWriter, db, storedType, flags.maxAge)`,
+		"data-source local fallback should emit sync hints for the stored resource name")
 
 	testSrc, err := os.ReadFile(filepath.Join(outputDir, "internal", "cli", "sync_hint_test.go"))
 	require.NoError(t, err, "sync_hint_test.go must compile the helper behavior in generated CLIs")

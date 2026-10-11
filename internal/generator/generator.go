@@ -2883,6 +2883,19 @@ func (g *Generator) prepareOutput() error {
 	return nil
 }
 
+// emitsLegacyStoreAdoption matches the helpers.go.tmpl gate for
+// legacyStoreAdoptPaths: a local store plus credential auth. Learn-only
+// stores set VisionSet.Store without hasDataLayer and still define it.
+func (g *Generator) emitsLegacyStoreAdoption() bool {
+	if g == nil || g.Spec == nil {
+		return false
+	}
+	if !g.hasDataLayer() && !g.VisionSet.Store {
+		return false
+	}
+	return g.Spec.Auth.Type != "" && g.Spec.Auth.Type != "none"
+}
+
 func (g *Generator) renderSingleFiles() error {
 	singleFiles := map[string]string{
 		"main.go.tmpl":                             filepath.Join("cmd", naming.CLI(g.Spec.Name), "main.go"),
@@ -2941,6 +2954,8 @@ func (g *Generator) renderSingleFiles() error {
 		"cliutil_duration_test.go.tmpl":            filepath.Join("internal", "cliutil", "duration_test.go"),
 		"cliutil_odata_date.go.tmpl":               filepath.Join("internal", "cliutil", "odata_date.go"),
 		"cliutil_odata_date_test.go.tmpl":          filepath.Join("internal", "cliutil", "odata_date_test.go"),
+		"cliutil_query.go.tmpl":                    filepath.Join("internal", "cliutil", "query.go"),
+		"cliutil_query_test.go.tmpl":               filepath.Join("internal", "cliutil", "query_test.go"),
 		"cliutil_test.go.tmpl":                     filepath.Join("internal", "cliutil", "cliutil_test.go"),
 		"mcp_bound.go.tmpl":                        filepath.Join("internal", "mcp", "bound", "bound.go"),
 		"mcp_bound_test.go.tmpl":                   filepath.Join("internal", "mcp", "bound", "bound_test.go"),
@@ -2954,6 +2969,12 @@ func (g *Generator) renderSingleFiles() error {
 		"NOTICE.tmpl":                              "NOTICE",
 	}
 	maps.Copy(singleFiles, cobratreeWalkerTemplateFiles())
+	if g.emitsLegacyStoreAdoption() {
+		singleFiles["store_adopt_linux.go.tmpl"] = filepath.Join("internal", "cli", "store_adopt_linux.go")
+		singleFiles["store_adopt_darwin.go.tmpl"] = filepath.Join("internal", "cli", "store_adopt_darwin.go")
+		singleFiles["store_adopt_windows.go.tmpl"] = filepath.Join("internal", "cli", "store_adopt_windows.go")
+		singleFiles["store_adopt_other.go.tmpl"] = filepath.Join("internal", "cli", "store_adopt_other.go")
+	}
 	if g.Spec.UsesBrowserHTTPTransport() {
 		singleFiles["chrome.go.tmpl"] = filepath.Join("internal", "client", "chrome.go")
 		singleFiles["chrome_profile.go.tmpl"] = filepath.Join("internal", "client", "chrome_profile.go")
@@ -3162,10 +3183,9 @@ func (g *Generator) renderOptionalSupportFiles() error {
 		}
 	}
 
-	// Emit the cliutil proxypath helper only for proxy-envelope clients —
-	// the BuildPath function is the only caller of net/url.Values in the
-	// cliutil package, and there's no point shipping it (and its tests)
-	// into CLIs that don't speak the proxy-envelope protocol.
+	// Emit the cliutil proxypath helper only for proxy-envelope clients.
+	// BuildPath is unused on REST CLIs, so the file and its tests stay out
+	// of those trees. Query encoding lives in EncodeQuery, which every CLI ships.
 	if g.Spec.ClientPattern == "proxy-envelope" {
 		if err := g.renderTemplate("cliutil_proxypath.go.tmpl", filepath.Join("internal", "cliutil", "proxypath.go"), g.Spec); err != nil {
 			return fmt.Errorf("rendering cliutil proxypath: %w", err)
@@ -3858,6 +3878,8 @@ func (g *Generator) GenerateMCPSurface() error {
 		"cliutil_extractnumber_test.go.tmpl":      filepath.Join("internal", "cliutil", "extractnumber_test.go"),
 		"cliutil_jwtshape.go.tmpl":                filepath.Join("internal", "cliutil", "jwtshape.go"),
 		"cliutil_jwtshape_test.go.tmpl":           filepath.Join("internal", "cliutil", "jwtshape_test.go"),
+		"cliutil_query.go.tmpl":                   filepath.Join("internal", "cliutil", "query.go"),
+		"cliutil_query_test.go.tmpl":              filepath.Join("internal", "cliutil", "query_test.go"),
 		"mcp_bound.go.tmpl":                       filepath.Join("internal", "mcp", "bound", "bound.go"),
 		"mcp_bound_test.go.tmpl":                  filepath.Join("internal", "mcp", "bound", "bound_test.go"),
 	}
