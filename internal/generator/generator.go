@@ -541,6 +541,7 @@ func New(s *spec.APISpec, outputDir string) *Generator {
 		"substackPublicationIDTemplatePath":        substackPublicationIDTemplatePath,
 		"safeName":                                 safeSQLName,
 		"resourceIDFieldOverrideEntries":           resourceIDFieldOverrideEntries,
+		"syncOwnedPartitionNames":                  syncOwnedPartitionNames,
 		"resourceIDBaseOverrideEntries":            resourceIDBaseOverrideEntries,
 		"resourceParentKeyColumnEntries":           resourceParentKeyColumnEntries,
 		"criticalResourceEntries":                  criticalResourceEntries,
@@ -4959,6 +4960,32 @@ func paginationDefaultEntries(syncable []profiler.SyncableResource, dependent []
 	return entries
 }
 
+// syncOwnedPartitionNames is the resource strings sync passes to UpsertBatch.
+// Write-through uses the same set so it cannot rename a partition sync refills.
+func syncOwnedPartitionNames(syncable []profiler.SyncableResource, dependent []profiler.DependentResource) []string {
+	seen := make(map[string]struct{}, len(syncable)+len(dependent))
+	names := make([]string, 0, len(syncable)+len(dependent))
+	add := func(name string) {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return
+		}
+		if _, ok := seen[name]; ok {
+			return
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	for _, resource := range syncable {
+		add(resource.Name)
+	}
+	for _, resource := range dependent {
+		add(resource.Name)
+	}
+	sort.Strings(names)
+	return names
+}
+
 func resourceIDFieldOverrideEntries(syncable []profiler.SyncableResource, dependent []profiler.DependentResource) []resourceIDFieldOverrideEntry {
 	overrides := map[string]string{}
 	for _, resource := range syncable {
@@ -7366,7 +7393,7 @@ func flagChangedExpr(p spec.Param) string {
 // bound value without flipping cobra's Changed bit.
 func flagRequiredUnsatisfiedExpr(p spec.Param) string {
 	zero := zeroValForParamRequired(p.Name, p.Type, p.Required, paramHasDefault(p))
-	return fmt.Sprintf("!%s && flag%s == %s && !flags.dryRun",
+	return fmt.Sprintf("!%s && flag%s == %s && !requiredInputWaived()",
 		flagChangedExpr(p), toCamel(paramIdent(p)), zero)
 }
 
@@ -8507,7 +8534,7 @@ func bodyRequiredPresenceChecks(endpoint spec.Endpoint, indent string) string {
 func writeBodyRequiredChecks(b *strings.Builder, endpoint spec.Endpoint, indent string, includeEnum bool) {
 	if endpoint.BodyJSONFallback {
 		if endpoint.BodyRequired {
-			fmt.Fprintf(b, "\n%sif !cmd.Flags().Changed(\"body-json\") && flagBodyJSON == \"\" && !flags.dryRun {", indent)
+			fmt.Fprintf(b, "\n%sif !cmd.Flags().Changed(\"body-json\") && flagBodyJSON == \"\" && !requiredInputWaived() {", indent)
 			fmt.Fprintf(b, "\n%s\treturn fmt.Errorf(\"required flag \\\"%%s\\\" not set\", \"body-json\")", indent)
 			fmt.Fprintf(b, "\n%s}", indent)
 		}
@@ -8721,7 +8748,7 @@ func renderFlatBodyRequiredCheck(b *strings.Builder, p spec.Param, indent, flagP
 	} else {
 		changedExpr = fmt.Sprintf("cmd.Flags().Changed(%q)", flag)
 	}
-	fmt.Fprintf(b, "\n%sif !%s && body%s == %s && !flags.dryRun {", indent, changedExpr, ident, zeroValForBodyParam(p))
+	fmt.Fprintf(b, "\n%sif !%s && body%s == %s && !requiredInputWaived() {", indent, changedExpr, ident, zeroValForBodyParam(p))
 	fmt.Fprintf(b, "\n%s\treturn fmt.Errorf(\"required flag \\\"%%s\\\" not set\", \"%s\")", indent, flag)
 	fmt.Fprintf(b, "\n%s}", indent)
 }
