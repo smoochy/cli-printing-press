@@ -2879,6 +2879,9 @@ func (g *Generator) prepareOutput() error {
 		g.resetHTMLSyncStubCache()
 	}
 	promoteSyncPathContextVars(g.Spec, g.profile)
+	if err := g.validateDependentSyncNames(); err != nil {
+		return err
+	}
 	if err := g.validateFreshnessCommandCoverage(); err != nil {
 		return err
 	}
@@ -3152,6 +3155,9 @@ func (g *Generator) renderOptionalSupportFiles() error {
 		}
 		if err := g.renderTemplate("cliutil_creds_perms_windows.go.tmpl", filepath.Join("internal", "cliutil", "creds_perms_windows.go"), authData); err != nil {
 			return fmt.Errorf("rendering cliutil creds perms windows: %w", err)
+		}
+		if err := g.renderTemplate("cliutil_creds_perms_windows_test.go.tmpl", filepath.Join("internal", "cliutil", "creds_perms_windows_test.go"), authData); err != nil {
+			return fmt.Errorf("rendering cliutil creds perms windows test: %w", err)
 		}
 		// Behavioral test proving the read-time guard is wired into config.Load:
 		// owner-locked = hit, group/world-readable = silent miss, env re-seed
@@ -4094,7 +4100,7 @@ func parentCommandActions(endpoints map[string]spec.Endpoint) string {
 	}
 	seen := make(map[string]bool, len(endpoints))
 	for name, endpoint := range endpoints {
-		if action := endpointActionVerb(name, endpoint.Method); action != "" {
+		if action := endpointActionVerb(name, endpoint.Method, endpoint.Path); action != "" {
 			seen[action] = true
 		}
 	}
@@ -4108,7 +4114,7 @@ func parentCommandActions(endpoints map[string]spec.Endpoint) string {
 	return joinCommandActions(actions)
 }
 
-func endpointActionVerb(name, method string) string {
+func endpointActionVerb(name, method, path string) string {
 	head := strings.ToLower(name)
 	if i := strings.IndexAny(head, "-_"); i > 0 {
 		head = head[:i]
@@ -4121,7 +4127,12 @@ func endpointActionVerb(name, method string) string {
 	case "GET":
 		return "get"
 	case "POST":
-		return "create"
+		// Action POSTs keep their own name. Claiming create here makes
+		// the parent advertise a verb the command does not have.
+		if spec.CreateShapedPOST(path, name) {
+			return "create"
+		}
+		return ""
 	case "PUT", "PATCH":
 		return "update"
 	case "DELETE":
@@ -6186,6 +6197,36 @@ func (g *Generator) renderRootProjectFiles(promotedCommands []PromotedCommand, p
 	}
 
 	return nil
+}
+
+// validateDependentSyncNames fails generation when a dependent resource
+// keeps the name of a top-level sync resource. flatSyncResources would
+// then drop that top-level resource and report a successful empty sync.
+func (g *Generator) validateDependentSyncNames() error {
+	if g == nil || g.profile == nil {
+		return nil
+	}
+	syncable := make(map[string]struct{}, len(g.profile.SyncableResources))
+	for _, resource := range g.profile.SyncableResources {
+		syncable[resource.Name] = struct{}{}
+	}
+	var collisions []string
+	seen := make(map[string]struct{})
+	for _, dep := range g.profile.DependentSyncResources {
+		if _, ok := syncable[dep.Name]; !ok {
+			continue
+		}
+		if _, dup := seen[dep.Name]; dup {
+			continue
+		}
+		seen[dep.Name] = struct{}{}
+		collisions = append(collisions, dep.Name)
+	}
+	if len(collisions) == 0 {
+		return nil
+	}
+	sort.Strings(collisions)
+	return fmt.Errorf("dependent sync resource name collides with a top-level sync resource: %s", strings.Join(collisions, ", "))
 }
 
 func (g *Generator) validateFreshnessCommandCoverage() error {
