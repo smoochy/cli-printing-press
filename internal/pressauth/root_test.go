@@ -43,11 +43,23 @@ func TestLoginHelpListsExpectedFlags(t *testing.T) {
 		t.Fatalf("login --help should exit cleanly, got: %v", err)
 	}
 
-	wantFlags := []string{"--login-url", "--complete-selector", "--refresh-endpoint", "--jwt-carrier-cookie", "--force"}
+	wantFlags := []string{"--login-url", "--complete-selector", "--complete-cookie", "--refresh-endpoint", "--jwt-carrier-cookie", "--force"}
 	for _, flag := range wantFlags {
 		if !strings.Contains(stdout, flag) {
 			t.Errorf("login --help output missing flag %q; got:\n%s", flag, stdout)
 		}
+	}
+	if !strings.Contains(stdout, "every page tab") {
+		t.Errorf("login --help output missing %q; got:\n%s", "every page tab", stdout)
+	}
+	if !strings.Contains(stdout, "neither of those flags is set") {
+		t.Errorf("login --help should limit the sign-out heuristic to the case with no completion flag; got:\n%s", stdout)
+	}
+	if strings.Count(stdout, "replaces the sign-out heuristic") < 2 {
+		t.Errorf("login --help should say both completion flags replace the sign-out heuristic; got:\n%s", stdout)
+	}
+	if strings.Contains(stdout, "--include-subdomains") {
+		t.Errorf("login --help should not offer --include-subdomains; got:\n%s", stdout)
 	}
 }
 

@@ -2,15 +2,18 @@ package pressauth
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/cdproto/storage"
+	"github.com/chromedp/cdproto/target"
 	"github.com/chromedp/chromedp"
 )
 
@@ -28,6 +31,15 @@ const noSandboxEnv = "PRESSAUTH_CHROME_NO_SANDBOX"
 // controlled Chrome window open indefinitely.
 const defaultCaptureTimeout = 10 * time.Minute
 
+// pageTargetType is the CDP target type for a tab's document. "tab" wrappers,
+// iframes, and workers are not pages and are not completion candidates.
+const pageTargetType = "page"
+
+// errTabUnreadable marks one page tab whose probe failed for a reason other
+// than the capture deadline. The completion check skips that tab and keeps
+// evaluating the rest.
+var errTabUnreadable = errors.New("tab unreadable")
+
 // CaptureOptions carries the user-supplied configuration into the
 // chromedp launcher. Domain is the target the captured cookies will be
 // stored under; LoginURL is what the controlled window first navigates to.
@@ -35,18 +47,20 @@ type CaptureOptions struct {
 	Domain           string
 	LoginURL         string
 	CompleteSelector string
+	CompleteCookie   string
 	RefreshEndpoint  string
 	JWTCarrierCookie string
 	Timeout          time.Duration
 }
 
 // Capture launches a controlled Chrome window via chromedp, navigates to
-// opts.LoginURL, waits for the login flow to complete (either an explicit
-// CompleteSelector becoming visible or the built-in heuristic firing),
-// snapshots every cookie in the browser, filters them to the target
-// domain, and returns the resulting *State. The temp user-data-dir is
-// deleted on both success and error paths so the user's daily Chrome
-// profile is never touched.
+// opts.LoginURL, waits for the login flow to complete (a named
+// complete-cookie, a complete-selector on any page tab, or, when neither
+// flag is set, the sign-out heuristic on any page tab), snapshots every
+// cookie in the browser,
+// filters them to the target domain, and returns the resulting *State.
+// The temp user-data-dir is deleted on both success and error paths so
+// the user's daily Chrome profile is never touched.
 //
 // Capture does not write to disk. The caller is responsible for handing
 // the returned State to Save once it confirms the capture succeeded.
@@ -131,57 +145,179 @@ func Capture(ctx context.Context, opts CaptureOptions) (*State, error) {
 	return state, nil
 }
 
-// waitForCompletion blocks until the login flow has finished. The
-// explicit-selector branch is preferred when the caller passes one; the
-// heuristic branch is the fallback. Both surface the underlying timeout
-// from timedCtx so the caller sees a uniform deadline error.
-func waitForCompletion(ctx context.Context, opts CaptureOptions) error {
-	if opts.CompleteSelector != "" {
-		if err := chromedp.Run(ctx, chromedp.WaitVisible(opts.CompleteSelector, chromedp.ByQuery)); err != nil {
-			return classifyChromeErr("waiting for completion selector", err)
-		}
-		return nil
-	}
-	return waitHeuristic(ctx, opts.LoginURL)
+// loginWaitConfig is the subset of CaptureOptions the completion check reads.
+type loginWaitConfig struct {
+	LoginURL         string
+	CompleteSelector string
+	CompleteCookie   string
 }
 
-// waitHeuristic polls the current page every second and declares login
-// complete when (a) the URL has moved off the login page, (b) no
-// password input is visible, and (c) a "sign out" / "logout" link is
-// visible. The heuristic gives up at the timeout encoded in ctx.
-func waitHeuristic(ctx context.Context, loginURL string) error {
-	parsed, err := url.Parse(loginURL)
-	if err != nil {
-		return fmt.Errorf("parsing login URL: %w", err)
+// pageSignal is one page tab's completion probe, independent of CDP.
+type pageSignal struct {
+	Href        string
+	HasPassword bool
+	HasSignout  bool
+	SelectorHit bool
+}
+
+// targetRef is a browser target reduced to the fields the completion check
+// needs, so tests can feed a target list without a Chrome session.
+type targetRef struct {
+	ID   string
+	Type string
+}
+
+// completionView is the capture browser surface the login check reads.
+// Production uses chromedp; tests substitute a scripted view.
+type completionView interface {
+	pageSignals(ctx context.Context, selector string) ([]pageSignal, error)
+	cookieNames(ctx context.Context) (map[string]struct{}, error)
+}
+
+// waitForCompletion blocks until the login flow has finished or ctx ends.
+func waitForCompletion(ctx context.Context, opts CaptureOptions) error {
+	return waitForLogin(ctx, loginWaitConfig{
+		LoginURL:         opts.LoginURL,
+		CompleteSelector: opts.CompleteSelector,
+		CompleteCookie:   strings.TrimSpace(opts.CompleteCookie),
+	}, newChromedpCompletionView())
+}
+
+// waitForLogin polls view until loginComplete reports done. The first check
+// runs immediately so a cookie or selector that is already present does not
+// wait out the interval.
+func waitForLogin(ctx context.Context, cfg loginWaitConfig, view completionView) error {
+	return waitForLoginEvery(ctx, cfg, view, time.Second)
+}
+
+func waitForLoginEvery(ctx context.Context, cfg loginWaitConfig, view completionView, interval time.Duration) error {
+	if interval <= 0 {
+		interval = time.Second
 	}
-	loginPath := parsed.Path
-	ticker := time.NewTicker(1 * time.Second)
+	// The sign-out heuristic compares paths. Either completion flag replaces
+	// that heuristic, so an unparseable login URL only matters when neither
+	// flag is set and the heuristic can still fire.
+	loginPath := ""
+	if cfg.CompleteSelector == "" && cfg.CompleteCookie == "" {
+		parsed, err := url.Parse(cfg.LoginURL)
+		if err != nil {
+			return fmt.Errorf("parsing login URL: %w", err)
+		}
+		loginPath = parsed.Path
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
+		done, err := completionTick(ctx, cfg, loginPath, view)
+		if err != nil {
+			return err
+		}
+		if done {
+			return nil
+		}
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("waiting for login completion: %w", ctx.Err())
 		case <-ticker.C:
-			done, err := heuristicTick(ctx, loginPath)
-			if err != nil {
-				return err
-			}
-			if done {
-				return nil
-			}
 		}
 	}
 }
 
-// heuristicTick runs one round of the heuristic checks against the live
-// page. Returning (true, nil) means the caller should stop polling.
-func heuristicTick(ctx context.Context, loginPath string) (bool, error) {
-	var (
-		currentURL   string
-		hasPassword  bool
-		hasSignoutEl bool
-	)
-	const probeScript = `({
+func completionTick(ctx context.Context, cfg loginWaitConfig, loginPath string, view completionView) (bool, error) {
+	pages, err := view.pageSignals(ctx, cfg.CompleteSelector)
+	if err != nil {
+		return false, err
+	}
+	var names map[string]struct{}
+	if cfg.CompleteCookie != "" {
+		names, err = view.cookieNames(ctx)
+		if err != nil {
+			return false, err
+		}
+	}
+	return loginComplete(cfg, loginPath, pages, names), nil
+}
+
+// loginComplete decides whether this observation finishes login.
+//
+//   - A configured complete-cookie finishes login when that name is in the
+//     browser, on any host. It does not consult the JWT carrier cookie;
+//     operators pass the same name to both flags when they want that.
+//   - A configured complete-selector finishes login when it is visible on
+//     any page tab.
+//   - When either flag is set, the sign-out heuristic does not run. When
+//     both are set, either signal is enough.
+//   - Otherwise the sign-out heuristic finishes login when any page tab
+//     matches. A password field on one tab does not block a different tab.
+func loginComplete(cfg loginWaitConfig, loginPath string, pages []pageSignal, cookieNames map[string]struct{}) bool {
+	cookieSet := cfg.CompleteCookie != ""
+	selectorSet := cfg.CompleteSelector != ""
+	if cookieSet {
+		if _, ok := cookieNames[cfg.CompleteCookie]; ok {
+			return true
+		}
+	}
+	if selectorSet {
+		for _, page := range pages {
+			if page.SelectorHit {
+				return true
+			}
+		}
+	}
+	if cookieSet || selectorSet {
+		return false
+	}
+	for _, page := range pages {
+		if heuristicMatches(page, loginPath) {
+			return true
+		}
+	}
+	return false
+}
+
+// heuristicMatches is the historical single-page check: no password field,
+// a sign-out or log-out link or button, and a path different from the login
+// URL when that URL has a path.
+func heuristicMatches(page pageSignal, loginPath string) bool {
+	if page.HasPassword || !page.HasSignout {
+		return false
+	}
+	if loginPath == "" {
+		return true
+	}
+	cur, err := url.Parse(page.Href)
+	if err != nil {
+		return false
+	}
+	return cur.Path != loginPath
+}
+
+// collectPageSignals probes every page tab. Non-page targets are ignored.
+// errTabUnreadable skips one tab; any other error stops the round.
+func collectPageSignals(targets []targetRef, probe func(id string) (pageSignal, error)) ([]pageSignal, error) {
+	pages := make([]pageSignal, 0, len(targets))
+	for _, tgt := range targets {
+		if tgt.Type != pageTargetType || tgt.ID == "" {
+			continue
+		}
+		sig, err := probe(tgt.ID)
+		if err != nil {
+			if errors.Is(err, errTabUnreadable) {
+				continue
+			}
+			return nil, err
+		}
+		pages = append(pages, sig)
+	}
+	return pages, nil
+}
+
+func completionProbeExpr(selector string) string {
+	encoded, err := json.Marshal(selector)
+	if err != nil {
+		encoded = []byte(`""`)
+	}
+	return fmt.Sprintf(`({
   href: location.href,
   hasPassword: !!document.querySelector('input[type=password]'),
   hasSignout: (function () {
@@ -194,42 +330,119 @@ func heuristicTick(ctx context.Context, loginPath string) (bool, error) {
              h.includes('signout') || h.includes('logout');
     });
   })(),
-})`
-	var probe struct {
+  selectorHit: (function () {
+    var sel = %s;
+    if (!sel) return false;
+    var el;
+    try { el = document.querySelector(sel); } catch (e) { return false; }
+    if (!el) return false;
+    return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+  })(),
+})`, encoded)
+}
+
+func completionDeadline(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return fmt.Errorf("waiting for login completion: %w", err)
+	}
+	return nil
+}
+
+// chromedpCompletionView reads page tabs and cookie names from the capture
+// browser attached to the context passed into each method.
+type chromedpCompletionView struct {
+	mu   sync.Mutex
+	tabs map[target.ID]context.Context
+}
+
+func newChromedpCompletionView() *chromedpCompletionView {
+	return &chromedpCompletionView{}
+}
+
+func (v *chromedpCompletionView) pageSignals(ctx context.Context, selector string) ([]pageSignal, error) {
+	infos, err := chromedp.Targets(ctx)
+	if err != nil {
+		if fatal := completionDeadline(err); fatal != nil {
+			return nil, fatal
+		}
+		return nil, nil
+	}
+	refs := make([]targetRef, 0, len(infos))
+	for _, info := range infos {
+		if info == nil {
+			continue
+		}
+		refs = append(refs, targetRef{ID: string(info.TargetID), Type: info.Type})
+	}
+	return collectPageSignals(refs, func(id string) (pageSignal, error) {
+		return v.probe(ctx, target.ID(id), selector)
+	})
+}
+
+func (v *chromedpCompletionView) cookieNames(ctx context.Context) (map[string]struct{}, error) {
+	cookies, err := snapshotCookies(ctx)
+	if err != nil {
+		if fatal := completionDeadline(err); fatal != nil {
+			return nil, fatal
+		}
+		return nil, nil
+	}
+	names := make(map[string]struct{}, len(cookies))
+	for _, c := range cookies {
+		if c == nil || c.Name == "" {
+			continue
+		}
+		names[c.Name] = struct{}{}
+	}
+	return names, nil
+}
+
+func (v *chromedpCompletionView) probe(ctx context.Context, id target.ID, selector string) (pageSignal, error) {
+	runCtx := v.tabContext(ctx, id)
+	var raw struct {
 		Href        string `json:"href"`
 		HasPassword bool   `json:"hasPassword"`
 		HasSignout  bool   `json:"hasSignout"`
+		SelectorHit bool   `json:"selectorHit"`
 	}
-	err := chromedp.Run(ctx, chromedp.Evaluate(probeScript, &probe))
+	err := chromedp.Run(runCtx, chromedp.Evaluate(completionProbeExpr(selector), &raw))
 	if err != nil {
-		// Treat transient evaluation errors during navigation as
-		// not-yet-ready, not a hard failure. A deadline error from the
-		// surrounding context will surface in the next select round.
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-			return false, fmt.Errorf("waiting for login completion: %w", err)
+		if fatal := completionDeadline(err); fatal != nil {
+			return pageSignal{}, fatal
 		}
-		return false, nil
+		// Navigation and a closing tab both surface as evaluation errors.
+		// Skip the tab; the deadline surfaces on the next select.
+		return pageSignal{}, errTabUnreadable
 	}
-	currentURL = probe.Href
-	hasPassword = probe.HasPassword
-	hasSignoutEl = probe.HasSignout
+	return pageSignal{
+		Href:        raw.Href,
+		HasPassword: raw.HasPassword,
+		HasSignout:  raw.HasSignout,
+		SelectorHit: raw.SelectorHit,
+	}, nil
+}
 
-	if hasPassword {
-		return false, nil
+func (v *chromedpCompletionView) tabContext(ctx context.Context, id target.ID) context.Context {
+	if c := chromedp.FromContext(ctx); c != nil && c.Target != nil && c.Target.TargetID == id {
+		return ctx
 	}
-	if !hasSignoutEl {
-		return false, nil
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.tabs == nil {
+		v.tabs = make(map[target.ID]context.Context)
 	}
-	if loginPath != "" {
-		curParsed, err := url.Parse(currentURL)
-		if err != nil {
-			return false, nil
-		}
-		if curParsed.Path == loginPath {
-			return false, nil
-		}
+	if existing, ok := v.tabs[id]; ok {
+		return existing
 	}
-	return true, nil
+	// Keep the attached context until the capture context ends. Cancelling it
+	// now would close the operator's tab: chromedp's cancel path calls
+	// Target.closeTarget.
+	tabCtx, _ := chromedp.NewContext(ctx, chromedp.WithTargetID(id))
+	v.tabs[id] = tabCtx
+	return tabCtx
 }
 
 // snapshotCookies returns every cookie the controlled browser knows
@@ -257,7 +470,7 @@ func snapshotCookies(ctx context.Context) ([]*network.Cookie, error) {
 func filterCookies(all []*network.Cookie, target string) map[string]string {
 	out := make(map[string]string, len(all))
 	for _, c := range all {
-		if !cookieDomainMatches(c.Domain, target) {
+		if c == nil || !cookieDomainMatches(c.Domain, target) {
 			continue
 		}
 		out[c.Name] = c.Value

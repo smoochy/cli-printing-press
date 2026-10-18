@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -17,6 +18,7 @@ import (
 type LoginFlags struct {
 	LoginURL         string
 	CompleteSelector string
+	CompleteCookie   string
 	RefreshEndpoint  string
 	JWTCarrierCookie string
 	Force            bool
@@ -39,13 +41,29 @@ encrypted on-disk state, and closes the window.
 The captured cookies are then served to any printed CLI that calls
 "press-auth cookies <domain>".
 
+Login finishes when any of these is true:
+
+  - --complete-cookie NAME is set and that cookie is present in the capture browser
+  - --complete-selector is set and that CSS selector is visible on any page tab
+  - neither of those flags is set, and the sign-out heuristic matches any page tab:
+    the tab's path differs from the login URL, no password field is visible,
+    and a sign-out or log-out link or button is present
+
+The heuristic and --complete-selector are checked on every page tab, not
+only the first. Setting either completion flag replaces the heuristic. When
+both are set, either signal finishes login and the heuristic does not run.
+--complete-cookie does not replace --jwt-carrier-cookie; pass the same name
+to both when that cookie should also drive refresh.
+
 Provide --refresh-endpoint and --jwt-carrier-cookie when the API issues a
 JWT session you want press-auth to refresh lazily on expiry.`,
 		Example: `  press-auth login example.com --login-url https://example.com/login
   press-auth login example.com --login-url https://example.com/login \
       --refresh-endpoint /account/token --jwt-carrier-cookie session
   press-auth login example.com --login-url https://example.com/login \
-      --complete-selector "a[href*=signout]"`,
+      --complete-selector "a[href*=signout]"
+  press-auth login example.com --login-url https://example.com/login \
+      --complete-cookie session`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			domain := args[0]
@@ -57,7 +75,8 @@ JWT session you want press-auth to refresh lazily on expiry.`,
 	}
 
 	cmd.Flags().StringVar(&lf.LoginURL, "login-url", "", "URL press-auth opens in the controlled Chrome window for you to log in")
-	cmd.Flags().StringVar(&lf.CompleteSelector, "complete-selector", "", "Optional CSS selector that signals login is complete (e.g. \"a[href*=signout]\")")
+	cmd.Flags().StringVar(&lf.CompleteSelector, "complete-selector", "", "CSS selector that signals login is complete; checked on every page tab and replaces the sign-out heuristic")
+	cmd.Flags().StringVar(&lf.CompleteCookie, "complete-cookie", "", "Cookie name whose presence in the capture browser means login is complete; replaces the sign-out heuristic")
 	cmd.Flags().StringVar(&lf.RefreshEndpoint, "refresh-endpoint", "", "API path press-auth GETs to refresh an expiring JWT (e.g. /account/token)")
 	cmd.Flags().StringVar(&lf.JWTCarrierCookie, "jwt-carrier-cookie", "", "Name of the cookie that holds the JWT; its exp claim drives refresh timing")
 	cmd.Flags().BoolVar(&lf.Force, "force", false, "Overwrite existing state for <domain> without prompting")
@@ -95,6 +114,7 @@ func runLogin(ctx context.Context, out io.Writer, domain string, lf *LoginFlags)
 		Domain:           domain,
 		LoginURL:         lf.LoginURL,
 		CompleteSelector: lf.CompleteSelector,
+		CompleteCookie:   strings.TrimSpace(lf.CompleteCookie),
 		RefreshEndpoint:  lf.RefreshEndpoint,
 		JWTCarrierCookie: lf.JWTCarrierCookie,
 		Timeout:          defaultCaptureTimeout,
