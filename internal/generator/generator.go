@@ -417,6 +417,7 @@ func New(s *spec.APISpec, outputDir string) *Generator {
 		"humanName":                      naming.HumanName,
 		"envPrefix":                      naming.EnvPrefix,
 		"mcpBlockedDestinationFlagNames": mcpBlockedDestinationFlagNames,
+		"mcpBlockedInputFlagNames":       mcpBlockedInputFlagNames,
 		"mcpToolName":                    naming.SnakeIdentifier,
 		"lookupEndpoint": func(api *spec.APISpec, ref string) templateEndpoint {
 			e, _ := lookupEndpointForTemplate(api, ref)
@@ -3656,6 +3657,10 @@ func shouldSanitizeCapturedResourceIDs(apiSpec *spec.APISpec) bool {
 
 func (g *Generator) Generate() error {
 	sanitizeCapturedResourceIDsForGenerate(g.Spec)
+	// CanonicalEnvVar fills EnvVarSpecs as a side effect. Single-file templates
+	// render in map order, so an env_vars-only spec otherwise emits different
+	// config depending on which file runs first.
+	g.Spec.NormalizeAuthEnvVarSpecs()
 	g.Spec.DropCollidingEndpointTemplateEnvOverrides()
 	applyLargeMCPSurfaceDefault(g.Spec, os.Stderr)
 	// Fresh prints default the self-learning loop on (opt out with
@@ -3722,6 +3727,11 @@ func (g *Generator) Generate() error {
 	}
 	if g.emitsConcurrentTokenRaceTest() {
 		if err := g.renderTemplate("client_token_race_test.go.tmpl", filepath.Join("internal", "client", "token_race_test.go"), g.clientTemplateData()); err != nil {
+			return err
+		}
+	}
+	if g.Spec.Auth.EffectiveOAuth2Grant() == spec.OAuth2GrantClientCredentials {
+		if err := g.renderTemplate("client_untrusted_mint_test.go.tmpl", filepath.Join("internal", "client", "untrusted_mint_test.go"), g.clientTemplateData()); err != nil {
 			return err
 		}
 	}
@@ -4459,6 +4469,12 @@ func (g *Generator) renderAuthFiles() error {
 	if err := g.renderTemplate(authTmpl, authPath, authData); err != nil {
 		return fmt.Errorf("rendering auth: %w", err)
 	}
+	if g.emitsBrowserLoginTrustTest(authTmpl) {
+		trustPath := filepath.Join("internal", "cli", "browser_login_trust_test.go")
+		if err := g.renderTemplate("auth_browser_login_trust_test.go.tmpl", trustPath, authData); err != nil {
+			return fmt.Errorf("rendering browser login trust test: %w", err)
+		}
+	}
 	if g.Spec.Auth.EffectiveOAuth2Grant() == spec.OAuth2GrantDeviceCode {
 		oauthPath := filepath.Join("internal", "oauth", "device.go")
 		if err := os.MkdirAll(filepath.Join(g.OutputDir, "internal", "oauth"), 0o755); err != nil {
@@ -4499,6 +4515,21 @@ func (g *Generator) authTemplateName() string {
 	default:
 		return "auth_simple.go.tmpl"
 	}
+}
+
+// emitsBrowserLoginTrustTest reports whether this print validates a browser
+// session after saving. The emitted test needs a real base URL and a GET
+// validation path so it can prove a loose config does not erase that save.
+func (g *Generator) emitsBrowserLoginTrustTest(authTmpl string) bool {
+	if g == nil || g.Spec == nil || authTmpl != "auth_browser.go.tmpl" {
+		return false
+	}
+	auth := g.Spec.Auth
+	if !auth.RequiresBrowserSession || strings.TrimSpace(auth.BrowserSessionValidationPath) == "" || strings.TrimSpace(g.Spec.BaseURL) == "" {
+		return false
+	}
+	method := strings.ToUpper(strings.TrimSpace(auth.BrowserSessionValidationMethod))
+	return method == "" || method == "GET"
 }
 
 func (g *Generator) emitsStdinSecretReader() bool {
