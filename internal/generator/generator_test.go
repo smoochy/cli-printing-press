@@ -125,6 +125,10 @@ func TestGenerateProjectsCompile(t *testing.T) {
 		"internal/cliutil/filelock_unix.go",
 		"internal/cliutil/filelock_windows.go",
 		"internal/cliutil/filelock_test.go",
+		"internal/cliutil/darwin_acl.go",
+		"internal/cliutil/darwin_acl_darwin.go",
+		"internal/cliutil/darwin_acl_test.go",
+		"internal/cliutil/darwin_acl_live_test.go",
 	}
 
 	tests := []struct {
@@ -168,9 +172,12 @@ func TestGenerateProjectsCompile(t *testing.T) {
 		// +2: cliutil.EncodeQuery and its test.
 		// +1: creds_perms_windows_test.go, the Windows SDDL alias resolver
 		// test. Auth-gated, so it lands for every token-bearing spec.
-		{name: "stytch", specPath: filepath.Join("..", "..", "testdata", "stytch.yaml"), expectedFiles: 188},
-		{name: "clerk", specPath: filepath.Join("..", "..", "testdata", "clerk.yaml"), expectedFiles: 192},
-		{name: "loops", specPath: filepath.Join("..", "..", "testdata", "loops.yaml"), expectedFiles: 189},
+		// +4: darwin ACL judgment (darwin_acl.go, darwin_acl_darwin.go,
+		// darwin_acl_test.go, darwin_acl_live_test.go). Always emitted:
+		// profile checks exist when auth is none.
+		{name: "stytch", specPath: filepath.Join("..", "..", "testdata", "stytch.yaml"), expectedFiles: 192},
+		{name: "clerk", specPath: filepath.Join("..", "..", "testdata", "clerk.yaml"), expectedFiles: 196},
+		{name: "loops", specPath: filepath.Join("..", "..", "testdata", "loops.yaml"), expectedFiles: 193},
 	}
 
 	for _, tt := range tests {
@@ -369,7 +376,7 @@ func TestGenerateCliutilPackage(t *testing.T) {
 
 	// All cliutil files must be emitted.
 	cliutilDir := filepath.Join(outputDir, "internal", "cliutil")
-	for _, name := range []string{"fanout.go", "text.go", "extractnumber.go", "extractnumber_test.go", "cliutil_test.go", "query.go", "query_test.go", "filelock.go", "filelock_unix.go", "filelock_windows.go", "filelock_test.go"} {
+	for _, name := range []string{"fanout.go", "text.go", "extractnumber.go", "extractnumber_test.go", "cliutil_test.go", "query.go", "query_test.go", "filelock.go", "filelock_unix.go", "filelock_windows.go", "filelock_test.go", "darwin_acl.go", "darwin_acl_darwin.go", "darwin_acl_test.go", "darwin_acl_live_test.go"} {
 		_, err := os.Stat(filepath.Join(cliutilDir, name))
 		require.NoError(t, err, "expected %s to be emitted", name)
 	}
@@ -399,6 +406,11 @@ func TestGenerateCliutilPackage(t *testing.T) {
 		{"filelock_windows.go", "golang.org/x/sys/windows"},
 		{"filelock_windows.go", "windows.LockFileEx("},
 		{"filelock_windows.go", "windows.LOCKFILE_FAIL_IMMEDIATELY"},
+		{"darwin_acl.go", "func CheckDarwinPrivateFileACL("},
+		{"darwin_acl.go", "chmod -N"},
+		{"darwin_acl_darwin.go", "unix.SYS_FGETATTRLIST"},
+		{"darwin_acl_darwin.go", "/usr/bin/dsmemberutil"},
+		{"darwin_acl_live_test.go", "func TestDarwinACLLive("},
 	} {
 		data, err := os.ReadFile(filepath.Join(cliutilDir, probe.file))
 		require.NoError(t, err)
@@ -15580,7 +15592,7 @@ func TestGeneratedGraphQLSyncForcesSingleWorkerUnderVerifyEnv(t *testing.T) {
 		"GraphQL sync.go must not retain the old 10-page default")
 	assert.Contains(t, string(syncGo), "attemptComplete := false",
 		"GraphQL sync.go must distinguish a proven natural end from a capped walk")
-	assert.Contains(t, string(syncGo), "db.SaveSyncProgress(resource, progressCursor, totalCount)",
+	assert.Contains(t, string(syncGo), "db.SaveSyncProgressInScope(resource, scopeKey, progressCursor, totalCount)",
 		"GraphQL sync.go must preserve resumable progress without advancing the completion watermark")
 	assert.Contains(t, string(syncGo), "conn.PageInfo.HasNextPage && conn.PageInfo.EndCursor != \"\" && conn.PageInfo.EndCursor != cursor",
 		"GraphQL sync.go must only preserve a cap-exit cursor when another page exists")
@@ -16864,6 +16876,7 @@ func TestPaginationDefaultEntriesDistinguishDependentContext(t *testing.T) {
 			SupportsPagination:       true,
 			PaginationCursorParam:    "offset",
 			PaginationCursorType:     "offset",
+			PaginationInitialCursor:  "0",
 			PaginationNextCursorPath: "paging.next",
 			PaginationLimitParam:     "per_page",
 			PaginationPageSize:       25,
@@ -16880,6 +16893,7 @@ func TestPaginationDefaultEntriesDistinguishDependentContext(t *testing.T) {
 	assert.Equal(t, "after", byKey["tasks"].CursorParam)
 	assert.Equal(t, "meta.next", byKey["tasks"].NextCursorPath)
 	assert.Equal(t, "offset", byKey["projects/tasks"].CursorParam)
+	assert.Equal(t, "0", byKey["projects/tasks"].InitialCursor)
 	assert.Equal(t, "paging.next", byKey["projects/tasks"].NextCursorPath)
 	assert.Equal(t, "per_page", byKey["projects/tasks"].LimitParam)
 	assert.Equal(t, 25, byKey["projects/tasks"].Limit)
@@ -19518,7 +19532,7 @@ func TestGenerateMCPMainExplicitStdioOnlyHonored(t *testing.T) {
 
 // TestGenerateMCPMainLargeAPIDefaultsCodeOrchestration confirms that large
 // APIs with no explicit orchestration mode get the Cloudflare MCP pattern by
-// default: remote-capable transport plus the thin search/execute surface.
+// default: remote-capable transport plus the thin search/read surface.
 func TestGenerateMCPMainLargeAPIDefaultsCodeOrchestration(t *testing.T) {
 	t.Parallel()
 
@@ -19557,7 +19571,9 @@ func TestGenerateMCPMainLargeAPIDefaultsCodeOrchestration(t *testing.T) {
 	codeOrch, err := os.ReadFile(codeOrchPath)
 	require.NoError(t, err, "code_orch.go must be emitted by the large-API default")
 	assert.Contains(t, string(codeOrch), `mcplib.NewTool("demo_search"`)
-	assert.Contains(t, string(codeOrch), `mcplib.NewTool("demo_execute"`)
+	assert.Contains(t, string(codeOrch), `mcplib.NewTool("demo_read"`)
+	assert.NotContains(t, string(codeOrch), `mcplib.NewTool("demo_execute"`,
+		"a read-only spec must not register the mutating execute tool")
 
 	toolsPath := filepath.Join(outputDir, "internal", "mcp", "tools.go")
 	toolsData, err := os.ReadFile(toolsPath)
@@ -19691,7 +19707,7 @@ func assertMCPMainUsesVersionVar(t *testing.T, body string) {
 
 // TestGenerateMCPCodeOrchestrationEmitsRegistryTools proves that when the
 // spec opts into code-orchestration, the generator emits only the registry
-// tools <api>_search, <api>_get, and <api>_execute as MCP tools, covering every
+// tools <api>_search, <api>_get, <api>_read, and <api>_execute as MCP tools, covering every
 // endpoint via a single registry. This is the thin surface pattern referenced by
 // Anthropic's 2026-04-22 post (Cloudflare's ~2,500-endpoint server in ~1K
 // tokens).
@@ -19715,6 +19731,7 @@ func TestGenerateMCPCodeOrchestrationEmitsRegistryTools(t *testing.T) {
 		`func RegisterCodeOrchestrationTools(`,
 		`mcplib.NewTool("loops_search"`,
 		`mcplib.NewTool("loops_get"`,
+		`mcplib.NewTool("loops_read"`,
 		`mcplib.NewTool("loops_execute"`,
 		`codeOrchEndpoints = []codeOrchEndpoint`,
 		`func handleCodeOrchSearch(`,

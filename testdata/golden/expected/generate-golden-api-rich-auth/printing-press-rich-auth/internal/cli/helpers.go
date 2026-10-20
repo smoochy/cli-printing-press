@@ -718,6 +718,97 @@ func (p *syncUserParams) validateResourceNames(known []string) error {
 		strings.Join(unknown, ", "), strings.Join(known, ", "))
 }
 
+// syncScopeTemplateVars are the base-URL and global path placeholders that
+// distinguish one tenant checkpoint from another. Version-shaped names are
+// ignored at runtime; they are not a tenant.
+var syncScopeTemplateVars = []string{}
+
+func syncScopeVarIgnored(name string) bool {
+	n := strings.ToLower(strings.TrimSpace(name))
+	n = strings.ReplaceAll(n, "-", "")
+	n = strings.ReplaceAll(n, "_", "")
+	return n == "apiversion" || n == "version"
+}
+
+func syncParamIsGlobalScope(name string) bool {
+	return false
+}
+
+// syncCheckpointScope is the tenant identity for one resource checkpoint.
+// Ordinary filters (--param, --global-param, --resource-param, --since,
+// --dates) narrow prune but stay out of the key, so a sort or window
+// override does not drop the incremental watermark. A declared global-scope
+// selector is the exception, and its effective value follows applyTo: flat
+// --param on flat walks, then --global-param, then --resource-param. An
+// empty key matches upgraded rows whose scope_key defaulted to "".
+func syncCheckpointScope(resource string, dependent bool, userParams *syncUserParams, templateVars, pathContext map[string]string) string {
+	var lines []string
+	seen := map[string]struct{}{}
+	add := func(kind, name, value string) {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return
+		}
+		if (kind == "template" || kind == "path") && syncScopeVarIgnored(name) {
+			return
+		}
+		key := kind + ":" + name
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		value = strings.ReplaceAll(value, "\n", " ")
+		value = strings.ReplaceAll(value, "\r", " ")
+		lines = append(lines, key+"="+value)
+	}
+	for _, name := range syncScopeTemplateVars {
+		if templateVars == nil {
+			continue
+		}
+		if value, ok := templateVars[name]; ok && strings.TrimSpace(value) != "" {
+			add("template", name, value)
+		}
+	}
+	for name, value := range pathContext {
+		if strings.TrimSpace(value) == "" {
+			continue
+		}
+		add("path", name, value)
+	}
+	if userParams != nil {
+		// Later sources overwrite earlier ones, matching applyTo. Dependent
+		// walks never send flat --param, so that map must not key them.
+		chosen := map[string]string{}
+		take := func(src map[string]string) {
+			for name, value := range src {
+				if syncParamIsGlobalScope(name) {
+					chosen[name] = value
+				}
+			}
+		}
+		if !dependent {
+			take(userParams.flatGlobal)
+		}
+		take(userParams.trueGlobal)
+		take(userParams.perResource[resource])
+		for name, value := range chosen {
+			add("param", name, value)
+		}
+	}
+	sort.Strings(lines)
+	return strings.Join(lines, "\n")
+}
+
+func syncClientTemplateVars(c any) map[string]string {
+	src, ok := c.(interface {
+		CurrentTemplateVars() map[string]string
+	})
+	if !ok || src == nil {
+		return nil
+	}
+	return src.CurrentTemplateVars()
+}
+
 // accessDenialPatterns matches API error bodies that indicate the request was
 // rejected for access-policy reasons rather than for input validity. Matching
 // is case-insensitive and uses word boundaries so common substrings inside
@@ -3251,6 +3342,7 @@ func writeCSVRows(w io.Writer, items []map[string]any) error {
 func writeCSVRow(w io.Writer, cells []string) {
 	escaped := make([]string, len(cells))
 	for i, cell := range cells {
+		cell = csvSafeCell(cell)
 		if strings.ContainsAny(cell, ",\"\r\n") {
 			escaped[i] = `"` + strings.ReplaceAll(cell, `"`, `""`) + `"`
 		} else {
@@ -3258,6 +3350,79 @@ func writeCSVRow(w io.Writer, cells []string) {
 		}
 	}
 	fmt.Fprintln(w, strings.Join(escaped, ","))
+}
+
+// csvSafeCell stops spreadsheet formula injection without turning a plain
+// signed decimal into text. Leading apostrophes are skipped so a value that
+// already has one stays distinguishable after a single-apostrophe unescape.
+func csvSafeCell(s string) string {
+	if csvPlainNumber(s) {
+		return s
+	}
+	i := 0
+	for i < len(s) && s[i] == '\'' {
+		i++
+	}
+	if csvFormulaLead(s[i:]) {
+		return "'" + s
+	}
+	return s
+}
+
+func csvFormulaLead(s string) bool {
+	// Fullwidth = + - @ are a common bypass of an ASCII-only check.
+	for _, r := range s {
+		switch r {
+		case '=', '+', '-', '@', '\t', '\r', '\n', '\uFF1D', '\uFF0B', '\uFF0D', '\uFF20':
+			return true
+		default:
+			return false
+		}
+	}
+	return false
+}
+
+func csvPlainNumber(s string) bool {
+	if s == "" {
+		return false
+	}
+	i := 0
+	if s[0] == '+' || s[0] == '-' {
+		i++
+	}
+	if i >= len(s) {
+		return false
+	}
+	digits := 0
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		digits++
+		i++
+	}
+	if i < len(s) && s[i] == '.' {
+		i++
+		for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+			digits++
+			i++
+		}
+	}
+	if digits == 0 {
+		return false
+	}
+	if i < len(s) && (s[i] == 'e' || s[i] == 'E') {
+		i++
+		if i < len(s) && (s[i] == '+' || s[i] == '-') {
+			i++
+		}
+		exp := 0
+		for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+			exp++
+			i++
+		}
+		if exp == 0 {
+			return false
+		}
+	}
+	return i == len(s)
 }
 
 func csvDeclaredHeader(documentedFields ...map[string]bool) []string {

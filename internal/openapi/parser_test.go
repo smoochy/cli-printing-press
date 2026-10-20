@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -10533,6 +10534,468 @@ paths:
 	}
 }
 
+// TestParseSingleArrayRecordKeepsObject pins the contract that a response
+// object unwraps to its one array only when every sibling is paging or
+// envelope metadata. mapResponse (Response.Type / ResponsePath) and the
+// primary-key walk (IDField, via unwrapItemSchema) share that predicate.
+func TestParseSingleArrayRecordKeepsObject(t *testing.T) {
+	t.Parallel()
+
+	yamlSpec := []byte(`openapi: "3.0.3"
+info:
+  title: Single Array Records
+  version: "1.0"
+servers:
+  - url: https://api.example.com
+paths:
+  /admins/{id}:
+    get:
+      operationId: getAdmin
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  type: {type: string}
+                  id: {type: string}
+                  name: {type: string}
+                  email: {type: string}
+                  team_ids:
+                    type: array
+                    items: {type: string}
+  /messages/{id}:
+    get:
+      operationId: getMessage
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: {type: string}
+                  threadId: {type: string}
+                  snippet: {type: string}
+                  payload:
+                    type: object
+                    properties:
+                      mimeType: {type: string}
+                  labelIds:
+                    type: array
+                    items: {type: string}
+  /servers/{id}:
+    get:
+      operationId: getServer
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  Name: {type: string}
+                  ID: {type: integer}
+                  Color: {type: string}
+                  ApiTokens:
+                    type: array
+                    items: {type: string}
+  /resource-pools/{poolId}:
+    get:
+      operationId: getResourcePool
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name: {type: string}
+                  cpu_allocation:
+                    type: object
+                    properties:
+                      limit: {type: integer}
+                  memory_allocation:
+                    type: object
+                    properties:
+                      limit: {type: integer}
+                  resource_pools:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: {type: string}
+  /device-commands/{commandId}:
+    get:
+      operationId: getDeviceCommand
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  commandId: {type: string}
+                  errors:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: {type: string}
+                        message: {type: string}
+  /alerts/{id}:
+    get:
+      operationId: getAlert
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: {type: string}
+                  description: {type: string}
+                  allowedActions:
+                    type: array
+                    items: {type: string}
+  /sites/{id}:
+    get:
+      operationId: getSite
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: {type: string}
+                  name: {type: string}
+                  externalIds:
+                    type: array
+                    items: {type: string}
+  /labels:
+    get:
+      operationId: listLabels
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  labels:
+                    type: array
+                    items:
+                      type: object
+                      required: [id]
+                      properties:
+                        id: {type: string}
+                        name: {type: string}
+  /events:
+    get:
+      operationId: listEvents
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  events:
+                    type: array
+                    items:
+                      type: object
+                      required: [event_ticker]
+                      properties:
+                        event_ticker: {type: string}
+                  cursor: {type: string}
+  /events-camel:
+    get:
+      operationId: listEventsCamel
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  Events:
+                    type: array
+                    items:
+                      type: object
+                      required: [event_ticker]
+                      properties:
+                        event_ticker: {type: string}
+                  NextPageToken: {type: string}
+                  HasMore: {type: boolean}
+  /bounces:
+    get:
+      operationId: listBounces
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  TotalCount: {type: integer}
+                  Bounces:
+                    type: array
+                    items:
+                      type: object
+                      required: [id]
+                      properties:
+                        id: {type: string}
+  /items:
+    get:
+      operationId: listItems
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [sku]
+                      properties:
+                        sku: {type: string}
+                  next_cursor: {type: string}
+  /searches:
+    get:
+      operationId: searchRecords
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      required: [id]
+                      properties:
+                        id: {type: string}
+                  request_id: {type: string}
+                  status_code: {type: integer}
+                  results_metadata:
+                    type: object
+                    properties:
+                      next_cursor: {type: string}
+  /tickets/query:
+    post:
+      operationId: queryTickets
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [id]
+                      properties:
+                        id: {type: integer}
+                  pageDetails:
+                    type: object
+                    properties:
+                      nextPageUrl: {type: string}
+  /wrapped-data:
+    get:
+      operationId: listWrappedData
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: {type: string}
+                  name: {type: string}
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      required: [sku]
+                      properties:
+                        sku: {type: string}
+  /positions:
+    get:
+      operationId: listPositions
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  event_positions:
+                    type: array
+                    items: {type: object}
+                  market_positions:
+                    type: array
+                    items: {type: object}
+  /events-malformed:
+    get:
+      operationId: listEventsMalformed
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  events:
+                    type: array
+                    items:
+                      type: object
+                      required: [event_ticker]
+                      properties:
+                        event_ticker: {type: string}
+                  legacy:
+                    type: array
+                  cursor: {type: string}
+  /events-malformed-record:
+    get:
+      operationId: getEventsMalformedRecord
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  events:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: {type: string}
+                  legacy:
+                    type: array
+                  name: {type: string}
+  /histories:
+    get:
+      operationId: listHistories
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  history:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: {type: string}
+                  historyId: {type: string}
+                  nextPageToken: {type: string}
+  /flags:
+    get:
+      operationId: getFlags
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: {type: string}
+                  tags:
+                    type: array
+                    items: {type: string}
+`)
+	parsed, err := Parse(yamlSpec)
+	require.NoError(t, err)
+
+	tests := []struct {
+		path     string
+		wantType string
+		wantPath string
+		wantID   string
+	}{
+		{path: "/admins/{id}", wantType: "object", wantPath: "", wantID: "id"},
+		{path: "/messages/{id}", wantType: "object", wantPath: "", wantID: "id"},
+		{path: "/servers/{id}", wantType: "object", wantPath: "", wantID: "ID"},
+		{path: "/resource-pools/{poolId}", wantType: "object", wantPath: "", wantID: "name"},
+		{path: "/device-commands/{commandId}", wantType: "object", wantPath: "", wantID: "commandId"},
+		{path: "/alerts/{id}", wantType: "object", wantPath: "", wantID: "id"},
+		{path: "/sites/{id}", wantType: "object", wantPath: "", wantID: "id"},
+		{path: "/labels", wantType: "array", wantPath: "labels", wantID: "id"},
+		{path: "/events", wantType: "array", wantPath: "events", wantID: "event_ticker"},
+		{path: "/events-camel", wantType: "array", wantPath: "Events", wantID: "event_ticker"},
+		{path: "/bounces", wantType: "array", wantPath: "Bounces", wantID: "id"},
+		{path: "/items", wantType: "array", wantPath: "items", wantID: "sku"},
+		{path: "/searches", wantType: "array", wantPath: "results", wantID: "id"},
+		{path: "/tickets/query", wantType: "array", wantPath: "items", wantID: "id"},
+		{path: "/wrapped-data", wantType: "array", wantPath: "data", wantID: "sku"},
+		{path: "/positions", wantType: "object", wantPath: "", wantID: ""},
+		{path: "/events-malformed", wantType: "array", wantPath: "events", wantID: "event_ticker"},
+		{path: "/events-malformed-record", wantType: "object", wantPath: "", wantID: "name"},
+		{path: "/histories", wantType: "object", wantPath: "", wantID: "historyId"},
+		{path: "/flags", wantType: "object", wantPath: "", wantID: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			t.Parallel()
+			ep := findEndpoint(t, parsed, tt.path)
+			assert.Equal(t, tt.wantType, ep.Response.Type)
+			assert.Equal(t, tt.wantPath, ep.ResponsePath)
+			assert.Equal(t, tt.wantID, ep.IDField)
+		})
+	}
+}
+
+func TestSingleArrayPropertyRefBranches(t *testing.T) {
+	t.Parallel()
+
+	items, name := singleArrayPropertyRef(nil)
+	assert.Nil(t, items)
+	assert.Empty(t, name)
+
+	items, name = singleArrayPropertyRef(&openapi3.Schema{})
+	assert.Nil(t, items)
+	assert.Empty(t, name)
+
+	for _, raw := range []string{"commandId", "historyId", "name", "id", "payload", "provider_type", "sizeEstimate", "status"} {
+		assert.Falsef(t, isEnvelopeMetadataProperty(raw), "%s is a record field", raw)
+	}
+	for _, raw := range []string{"cursor", "CURSOR", "next_page", "NextPage", "has_more", "HasMore", "total_count", "TotalCount", "per_page", "perPage", "request_id", "status_code", "results_metadata", "pageDetails", "nextPageToken", "resultSizeEstimate"} {
+		assert.Truef(t, isEnvelopeMetadataProperty(raw), "%s is envelope metadata", raw)
+	}
+}
+
 // TestParseIDFieldResourcePrefixedHeuristic covers list responses whose item
 // schemas key off `<singular_resource>_id` (or `_uuid`/`_guid`/`_uid`) instead
 // of a bare `id`. Without this heuristic, APIs like podscan whose Category
@@ -14885,5 +15348,160 @@ func TestSetParamMaximumNormalizesBounds(t *testing.T) {
 		setParamMaximum(&p, &openapi3.Schema{})
 		assert.Nil(t, p.Maximum)
 		assert.Nil(t, p.ExclusiveMaximum)
+	})
+}
+
+func TestSetParamMinimumNormalizesBounds(t *testing.T) {
+	f := func(v float64) *float64 { return &v }
+	tru := true
+
+	t.Run("inclusive minimum", func(t *testing.T) {
+		p := spec.Param{Type: "int"}
+		setParamMinimum(&p, &openapi3.Schema{Min: f(3)})
+		require.NotNil(t, p.Minimum)
+		assert.Equal(t, 3.0, *p.Minimum)
+	})
+
+	t.Run("openapi 3.0 minimum plus exclusiveMinimum true", func(t *testing.T) {
+		for _, typ := range []string{"int", "integer"} {
+			p := spec.Param{Type: typ}
+			setParamMinimum(&p, &openapi3.Schema{Min: f(0), ExclusiveMin: openapi3.ExclusiveBound{Bool: &tru}})
+			require.NotNil(t, p.Minimum)
+			assert.Equal(t, 1.0, *p.Minimum, typ)
+		}
+	})
+
+	t.Run("openapi 3.1 numeric exclusiveMinimum", func(t *testing.T) {
+		p := spec.Param{Type: "integer"}
+		setParamMinimum(&p, &openapi3.Schema{ExclusiveMin: openapi3.ExclusiveBound{Value: f(1.2)}})
+		require.NotNil(t, p.Minimum)
+		assert.Equal(t, 2.0, *p.Minimum)
+	})
+
+	t.Run("inclusive minimum wins when it is tighter", func(t *testing.T) {
+		p := spec.Param{Type: "int"}
+		setParamMinimum(&p, &openapi3.Schema{Min: f(5), ExclusiveMin: openapi3.ExclusiveBound{Value: f(1.2)}})
+		require.NotNil(t, p.Minimum)
+		assert.Equal(t, 5.0, *p.Minimum)
+	})
+
+	t.Run("non-integer keeps the inclusive minimum", func(t *testing.T) {
+		p := spec.Param{Type: "number"}
+		setParamMinimum(&p, &openapi3.Schema{Min: f(0), ExclusiveMin: openapi3.ExclusiveBound{Bool: &tru}})
+		require.NotNil(t, p.Minimum)
+		assert.Equal(t, 0.0, *p.Minimum)
+	})
+
+	t.Run("nil schema", func(t *testing.T) {
+		p := spec.Param{Type: "int"}
+		setParamMinimum(&p, nil)
+		assert.Nil(t, p.Minimum)
+		assert.NotPanics(t, func() { setParamMinimum(nil, &openapi3.Schema{Min: f(1)}) })
+	})
+
+	t.Run("allOf minimum is the only bound", func(t *testing.T) {
+		p := spec.Param{Type: "int"}
+		setParamMinimum(&p, &openapi3.Schema{
+			AllOf: openapi3.SchemaRefs{{Value: &openapi3.Schema{Min: f(1)}}},
+		})
+		require.NotNil(t, p.Minimum)
+		assert.Equal(t, 1.0, *p.Minimum)
+	})
+
+	t.Run("allOf keeps the tighter floor", func(t *testing.T) {
+		p := spec.Param{Type: "integer"}
+		setParamMinimum(&p, &openapi3.Schema{
+			Min: f(0),
+			AllOf: openapi3.SchemaRefs{
+				nil,
+				{Value: nil},
+				{Value: &openapi3.Schema{Min: f(1)}},
+				{Value: &openapi3.Schema{Min: f(4)}},
+			},
+		})
+		require.NotNil(t, p.Minimum)
+		assert.Equal(t, 4.0, *p.Minimum)
+	})
+
+	t.Run("direct minimum stays when it is tighter than allOf", func(t *testing.T) {
+		p := spec.Param{Type: "int"}
+		setParamMinimum(&p, &openapi3.Schema{
+			Min:   f(5),
+			AllOf: openapi3.SchemaRefs{{Value: &openapi3.Schema{Min: f(1)}}},
+		})
+		require.NotNil(t, p.Minimum)
+		assert.Equal(t, 5.0, *p.Minimum)
+	})
+
+	t.Run("nested allOf", func(t *testing.T) {
+		p := spec.Param{Type: "int"}
+		setParamMinimum(&p, &openapi3.Schema{
+			AllOf: openapi3.SchemaRefs{{
+				Value: &openapi3.Schema{
+					AllOf: openapi3.SchemaRefs{{Value: &openapi3.Schema{Min: f(3)}}},
+				},
+			}},
+		})
+		require.NotNil(t, p.Minimum)
+		assert.Equal(t, 3.0, *p.Minimum)
+	})
+
+	t.Run("allOf exclusiveMinimum normalizes for integer members", func(t *testing.T) {
+		p := spec.Param{Type: "string"}
+		member := &openapi3.Schema{
+			Type:         &openapi3.Types{openapi3.TypeInteger},
+			Min:          f(0),
+			ExclusiveMin: openapi3.ExclusiveBound{Bool: &tru},
+		}
+		setParamMinimum(&p, &openapi3.Schema{AllOf: openapi3.SchemaRefs{{Value: member}}})
+		require.NotNil(t, p.Minimum)
+		assert.Equal(t, 1.0, *p.Minimum)
+	})
+
+	t.Run("allOf exclusive bound can beat a lower inclusive minimum", func(t *testing.T) {
+		p := spec.Param{Type: "int"}
+		setParamMinimum(&p, &openapi3.Schema{
+			Min: f(1),
+			AllOf: openapi3.SchemaRefs{{
+				Value: &openapi3.Schema{ExclusiveMin: openapi3.ExclusiveBound{Value: f(1.2)}},
+			}},
+		})
+		require.NotNil(t, p.Minimum)
+		assert.Equal(t, 2.0, *p.Minimum)
+	})
+
+	t.Run("non-integer allOf keeps the inclusive floor", func(t *testing.T) {
+		p := spec.Param{Type: "number"}
+		setParamMinimum(&p, &openapi3.Schema{
+			Min: f(0),
+			AllOf: openapi3.SchemaRefs{{
+				Value: &openapi3.Schema{Min: f(2.5), ExclusiveMin: openapi3.ExclusiveBound{Bool: &tru}},
+			}},
+		})
+		require.NotNil(t, p.Minimum)
+		assert.Equal(t, 2.5, *p.Minimum)
+	})
+
+	t.Run("non-finite allOf bound loses to a finite sibling", func(t *testing.T) {
+		nan := math.NaN()
+		p := spec.Param{Type: "int"}
+		setParamMinimum(&p, &openapi3.Schema{
+			Min: &nan,
+			AllOf: openapi3.SchemaRefs{
+				{Value: &openapi3.Schema{Min: &nan}},
+				{Value: &openapi3.Schema{Min: f(4)}},
+			},
+		})
+		require.NotNil(t, p.Minimum)
+		assert.Equal(t, 4.0, *p.Minimum)
+	})
+
+	t.Run("cyclic allOf does not recurse forever", func(t *testing.T) {
+		schema := &openapi3.Schema{Min: f(2)}
+		schema.AllOf = openapi3.SchemaRefs{{Value: schema}}
+		p := spec.Param{Type: "int"}
+		assert.NotPanics(t, func() { setParamMinimum(&p, schema) })
+		require.NotNil(t, p.Minimum)
+		assert.Equal(t, 2.0, *p.Minimum)
 	})
 }

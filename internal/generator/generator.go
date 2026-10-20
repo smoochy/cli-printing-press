@@ -462,6 +462,15 @@ func New(s *spec.APISpec, outputDir string) *Generator {
 		"endpointIsReadCommand": func(endpoint spec.Endpoint, opName string) bool {
 			return endpointIsReadCommandShared(endpoint, opName, sharedGETRPCPaths(g.Spec.Resources))
 		},
+		"codeOrchNeedsConfirm": func(endpoint spec.Endpoint, opName string) bool {
+			return codeOrchEndpointNeedsConfirm(endpoint, opName, sharedGETRPCPaths(g.Spec.Resources))
+		},
+		"codeOrchHasReadEndpoints": func() bool {
+			return codeOrchHasEndpointClass(g.Spec.Resources, false)
+		},
+		"codeOrchHasConfirmEndpoints": func() bool {
+			return codeOrchHasEndpointClass(g.Spec.Resources, true)
+		},
 		"hasMultipartRequest":          hasMultipartRequest,
 		"hasRawRequest":                hasRawRequest,
 		"formBodyMaps":                 formBodyMaps,
@@ -3030,6 +3039,10 @@ func (g *Generator) renderSingleFiles() error {
 		"cliutil_filelock_unix.go.tmpl":            filepath.Join("internal", "cliutil", "filelock_unix.go"),
 		"cliutil_filelock_windows.go.tmpl":         filepath.Join("internal", "cliutil", "filelock_windows.go"),
 		"cliutil_filelock_test.go.tmpl":            filepath.Join("internal", "cliutil", "filelock_test.go"),
+		"cliutil_darwin_acl.go.tmpl":               filepath.Join("internal", "cliutil", "darwin_acl.go"),
+		"cliutil_darwin_acl_darwin.go.tmpl":        filepath.Join("internal", "cliutil", "darwin_acl_darwin.go"),
+		"cliutil_darwin_acl_test.go.tmpl":          filepath.Join("internal", "cliutil", "darwin_acl_test.go"),
+		"cliutil_darwin_acl_live_test.go.tmpl":     filepath.Join("internal", "cliutil", "darwin_acl_live_test.go"),
 		"cliutil_testenv.go.tmpl":                  filepath.Join("internal", "cliutil", "testenv", "testenv.go"),
 		"cliutil_testenv_sandbox_unix.go.tmpl":     filepath.Join("internal", "cliutil", "testenv", "sandbox_unix.go"),
 		"cliutil_testenv_sandbox_windows.go.tmpl":  filepath.Join("internal", "cliutil", "testenv", "sandbox_windows.go"),
@@ -3982,6 +3995,10 @@ func (g *Generator) GenerateMCPSurface() error {
 		"cliutil_filelock_unix.go.tmpl":           filepath.Join("internal", "cliutil", "filelock_unix.go"),
 		"cliutil_filelock_windows.go.tmpl":        filepath.Join("internal", "cliutil", "filelock_windows.go"),
 		"cliutil_filelock_test.go.tmpl":           filepath.Join("internal", "cliutil", "filelock_test.go"),
+		"cliutil_darwin_acl.go.tmpl":              filepath.Join("internal", "cliutil", "darwin_acl.go"),
+		"cliutil_darwin_acl_darwin.go.tmpl":       filepath.Join("internal", "cliutil", "darwin_acl_darwin.go"),
+		"cliutil_darwin_acl_test.go.tmpl":         filepath.Join("internal", "cliutil", "darwin_acl_test.go"),
+		"cliutil_darwin_acl_live_test.go.tmpl":    filepath.Join("internal", "cliutil", "darwin_acl_live_test.go"),
 		"cliutil_testenv.go.tmpl":                 filepath.Join("internal", "cliutil", "testenv", "testenv.go"),
 		"cliutil_testenv_sandbox_unix.go.tmpl":    filepath.Join("internal", "cliutil", "testenv", "sandbox_unix.go"),
 		"cliutil_testenv_sandbox_windows.go.tmpl": filepath.Join("internal", "cliutil", "testenv", "sandbox_windows.go"),
@@ -5019,6 +5036,7 @@ type paginationDefaultEntry struct {
 	Name           string
 	CursorParam    string
 	CursorType     string
+	InitialCursor  string
 	NextCursorPath string
 	LimitParam     string
 	Limit          int
@@ -5079,7 +5097,7 @@ func pathTemplateVarNames(path string) []string {
 
 func paginationDefaultEntries(syncable []profiler.SyncableResource, dependent []profiler.DependentResource) []paginationDefaultEntry {
 	defaults := map[string]paginationDefaultEntry{}
-	add := func(key, name, cursorParam, cursorType, nextCursorPath, limitParam string, limit int, supportsPagination bool) {
+	add := func(key, name, cursorParam, cursorType, initialCursor, nextCursorPath, limitParam string, limit int, supportsPagination bool) {
 		if !supportsPagination || key == "" || name == "" {
 			return
 		}
@@ -5091,16 +5109,17 @@ func paginationDefaultEntries(syncable []profiler.SyncableResource, dependent []
 			Name:           name,
 			CursorParam:    cursorParam,
 			CursorType:     cursorType,
+			InitialCursor:  initialCursor,
 			NextCursorPath: nextCursorPath,
 			LimitParam:     limitParam,
 			Limit:          limit,
 		}
 	}
 	for _, resource := range syncable {
-		add(resource.Name, resource.Name, resource.PaginationCursorParam, resource.PaginationCursorType, resource.PaginationNextCursorPath, resource.PaginationLimitParam, resource.PaginationPageSize, resource.SupportsPagination)
+		add(resource.Name, resource.Name, resource.PaginationCursorParam, resource.PaginationCursorType, resource.PaginationInitialCursor, resource.PaginationNextCursorPath, resource.PaginationLimitParam, resource.PaginationPageSize, resource.SupportsPagination)
 	}
 	for _, resource := range dependent {
-		add(resource.ParentResource+"/"+resource.Name, resource.Name, resource.PaginationCursorParam, resource.PaginationCursorType, resource.PaginationNextCursorPath, resource.PaginationLimitParam, resource.PaginationPageSize, resource.SupportsPagination)
+		add(resource.ParentResource+"/"+resource.Name, resource.Name, resource.PaginationCursorParam, resource.PaginationCursorType, resource.PaginationInitialCursor, resource.PaginationNextCursorPath, resource.PaginationLimitParam, resource.PaginationPageSize, resource.SupportsPagination)
 	}
 
 	keys := make([]string, 0, len(defaults))
