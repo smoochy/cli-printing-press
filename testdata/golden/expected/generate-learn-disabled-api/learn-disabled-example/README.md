@@ -267,9 +267,11 @@ Verifies configuration, credentials, and connectivity to the API.
 
 ## Configuration
 
-Run `learn-disabled-example-pp-cli doctor` to see the resolved config, data, state, and cache directories. The platform-default config path is `` on macOS/Linux and `%USERPROFILE%\.config\learn-disabled-example-pp-cli\config.json` on Windows; `--home`, `LEARN_DISABLED_EXAMPLE_HOME`, and per-kind env vars can relocate it.
+Run `learn-disabled-example-pp-cli doctor` to see the resolved config, data, state, and cache directories. The platform-default config path is `~/.config/learn-disabled-example-pp-cli/config.toml` on macOS/Linux and `%USERPROFILE%\.config\learn-disabled-example-pp-cli\config.toml` on Windows; `--home`, `LEARN_DISABLED_EXAMPLE_HOME`, and per-kind env vars can relocate it.
 
 Static request headers can be configured under `headers`; per-command header overrides take precedence.
+
+`--ca-cert`, `LEARN_DISABLED_EXAMPLE_CA_CERT`, or `ca_cert` adds a PEM CA bundle to the system trust roots. `--tls-server-name`, `LEARN_DISABLED_EXAMPLE_TLS_SERVER_NAME`, or `tls_server_name` is the name checked against the certificate when the dialed address does not match it. Precedence is flag, then environment, then the config file. A config file other users can change does not supply these settings. Certificate verification failures are not retried.
 
 Environment variables:
 

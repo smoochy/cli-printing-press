@@ -124,7 +124,9 @@ func TestGenerateProjectsCompile(t *testing.T) {
 		"internal/cliutil/filelock.go",
 		"internal/cliutil/filelock_unix.go",
 		"internal/cliutil/filelock_windows.go",
+		"internal/cliutil/windows_account.go",
 		"internal/cliutil/filelock_test.go",
+		"internal/cliutil/creds_perms_eval.go",
 		"internal/cliutil/darwin_acl.go",
 		"internal/cliutil/darwin_acl_darwin.go",
 		"internal/cliutil/darwin_acl_test.go",
@@ -175,9 +177,10 @@ func TestGenerateProjectsCompile(t *testing.T) {
 		// +4: darwin ACL judgment (darwin_acl.go, darwin_acl_darwin.go,
 		// darwin_acl_test.go, darwin_acl_live_test.go). Always emitted:
 		// profile checks exist when auth is none.
-		{name: "stytch", specPath: filepath.Join("..", "..", "testdata", "stytch.yaml"), expectedFiles: 192},
-		{name: "clerk", specPath: filepath.Join("..", "..", "testdata", "clerk.yaml"), expectedFiles: 196},
-		{name: "loops", specPath: filepath.Join("..", "..", "testdata", "loops.yaml"), expectedFiles: 193},
+		// +1: cliutil/windows_account.go, the shared Windows SID helpers.
+		{name: "stytch", specPath: filepath.Join("..", "..", "testdata", "stytch.yaml"), expectedFiles: 193},
+		{name: "clerk", specPath: filepath.Join("..", "..", "testdata", "clerk.yaml"), expectedFiles: 197},
+		{name: "loops", specPath: filepath.Join("..", "..", "testdata", "loops.yaml"), expectedFiles: 194},
 	}
 
 	for _, tt := range tests {
@@ -376,7 +379,7 @@ func TestGenerateCliutilPackage(t *testing.T) {
 
 	// All cliutil files must be emitted.
 	cliutilDir := filepath.Join(outputDir, "internal", "cliutil")
-	for _, name := range []string{"fanout.go", "text.go", "extractnumber.go", "extractnumber_test.go", "cliutil_test.go", "query.go", "query_test.go", "filelock.go", "filelock_unix.go", "filelock_windows.go", "filelock_test.go", "darwin_acl.go", "darwin_acl_darwin.go", "darwin_acl_test.go", "darwin_acl_live_test.go"} {
+	for _, name := range []string{"fanout.go", "text.go", "extractnumber.go", "extractnumber_test.go", "cliutil_test.go", "query.go", "query_test.go", "filelock.go", "filelock_unix.go", "filelock_windows.go", "windows_account.go", "filelock_test.go", "darwin_acl.go", "darwin_acl_darwin.go", "darwin_acl_test.go", "darwin_acl_live_test.go"} {
 		_, err := os.Stat(filepath.Join(cliutilDir, name))
 		require.NoError(t, err, "expected %s to be emitted", name)
 	}
@@ -406,6 +409,9 @@ func TestGenerateCliutilPackage(t *testing.T) {
 		{"filelock_windows.go", "golang.org/x/sys/windows"},
 		{"filelock_windows.go", "windows.LockFileEx("},
 		{"filelock_windows.go", "windows.LOCKFILE_FAIL_IMMEDIATELY"},
+		{"filelock_windows.go", "currentUserSID()"},
+		{"windows_account.go", "func currentUserSID("},
+		{"windows_account.go", "func resolveSDDLAlias("},
 		{"darwin_acl.go", "func CheckDarwinPrivateFileACL("},
 		{"darwin_acl.go", "chmod -N"},
 		{"darwin_acl_darwin.go", "unix.SYS_FGETATTRLIST"},
@@ -421,6 +427,8 @@ func TestGenerateCliutilPackage(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotContains(t, string(winLock), "syscall.LockFileEx",
 		"Windows file lock must use golang.org/x/sys/windows, not syscall.LockFileEx")
+	assert.NotContains(t, string(winLock), "func trustCurrentUserSID")
+	assert.NotContains(t, string(winLock), "func trustResolveSDDLAlias")
 
 	textSrc, err := os.ReadFile(filepath.Join(cliutilDir, "text.go"))
 	require.NoError(t, err)
@@ -1986,6 +1994,10 @@ func TestGenerateOAuth2DeviceCodeAuth(t *testing.T) {
 	assert.Contains(t, authGo, `cliutil.IsVerifyEnv()`, "login and refresh short-circuit in verify mode")
 	assert.Equal(t, 3, strings.Count(authGo, "return authTransportErr(err)"),
 		"device poll and refresh must classify a plaintext credential refusal as a config error")
+	assert.Equal(t, 3, strings.Count(authGo, "flags.oauthHTTPClient(cfg)"),
+		"device login, poll, and refresh must build the trust-aware token client")
+	assert.NotContains(t, oauthGo, "http.DefaultClient")
+	assert.Contains(t, oauthGo, "oauth http client is required")
 	assert.Contains(t, authGo, `Annotations: map[string]string{"mcp:hidden": "true"}`, "interactive auth commands stay out of MCP")
 	assert.Contains(t, oauthGo, `const DeviceCodeGrant = "urn:ietf:params:oauth:grant-type:device_code"`)
 	assert.Contains(t, oauthGo, "cliutil.OAuthTokenHTTPClient(httpClient).Do(req)",
@@ -2946,7 +2958,7 @@ func TestGenerateBrowserChromeTransport(t *testing.T) {
 
 	clientGo := readGeneratedFile(t, outputDir, "internal", "client", "client.go")
 	assert.NotContains(t, clientGo, "github.com/enetx/")
-	assert.Contains(t, clientGo, "return chromeClient(timeout, jar, skipTLSVerify)")
+	assert.Contains(t, clientGo, "return chromeClient(timeout, jar, resolved)")
 
 	chromeGo := readGeneratedFile(t, outputDir, "internal", "client", "chrome.go")
 	assert.Contains(t, chromeGo, `chromeALPN = []string{"h2", "http/1.1"}`)
@@ -3061,7 +3073,7 @@ func TestGenerateBrowserChromeH3Transport(t *testing.T) {
 
 	clientGo := readGeneratedFile(t, outputDir, "internal", "client", "client.go")
 	assert.NotContains(t, clientGo, "github.com/enetx/")
-	assert.Contains(t, clientGo, "return chromeClient(timeout, jar, skipTLSVerify)")
+	assert.Contains(t, clientGo, "return chromeClient(timeout, jar, resolved)")
 	assert.NotContains(t, clientGo, `req.Header.Set("Accept",`,
 		"chrome header overlay owns Accept on the H3 path")
 
@@ -3187,7 +3199,7 @@ func TestGenerateBrowserHTTPTransportDisablesHTTP2(t *testing.T) {
 
 	clientGo := readGeneratedFile(t, outputDir, "internal", "client", "client.go")
 	assert.Contains(t, clientGo, `"crypto/tls"`)
-	assert.Contains(t, clientGo, `transport := http.DefaultTransport.(*http.Transport).Clone()`)
+	assert.Contains(t, clientGo, `cloneDefaultHTTPTransport()`)
 	assert.Contains(t, clientGo, `transport.TLSClientConfig.NextProtos = []string{"http/1.1"}`)
 	assert.Contains(t, clientGo, `transport.TLSNextProto = make(map[string]func(authority string, c *tls.Conn) http.RoundTripper)`)
 	assert.NotContains(t, clientGo, "github.com/enetx/")
@@ -3226,7 +3238,10 @@ func TestBrowserHTTPTransportRejectsH2ALPN(t *testing.T) {
 	}
 	t.Cleanup(func() { defaultTransport.TLSClientConfig = originalTLSConfig })
 
-	client := newHTTPClient(time.Second, nil)
+	client, err := newHTTPClient(time.Second, nil, tlsSettings{})
+	if err != nil {
+		t.Fatalf("newHTTPClient: %v", err)
+	}
 	resp, err := client.Get(server.URL)
 	if err != nil {
 		t.Fatalf("browser-http request failed after inherited h2 ALPN: %v", err)
@@ -14010,7 +14025,7 @@ func TestGenerate_ComposedAuthUsesBrowserTemplate(t *testing.T) {
 	assert.Contains(t, content, "decodeCookieValue")
 	assert.Contains(t, content, "cookieNameLooksCSRF")
 	assert.Contains(t, content, `"skip-validation"`)
-	assert.Contains(t, content, "validateComposedAuthProbe(composed, validationCookies, !skipValidation)")
+	assert.Contains(t, content, "validateComposedAuthProbe(composed, validationCookies, !skipValidation, cfg)")
 	assert.NotContains(t, content, "host_key LIKE")
 	assert.Contains(t, content, "printMissingCookieHint")
 	assert.Contains(t, content, "required cookies present")
@@ -16447,7 +16462,7 @@ func TestGeneratedSyncGatesSinceParamPerResource(t *testing.T) {
 
 	// Pin the full warning JSON shape so future template churn can't silently
 	// drop a key, rename the event, or break the agent-facing contract.
-	const fullWarning = `{"event":"sync_warning","resource":"%s","reason":"resource_not_incremental","message":"endpoint does not declare a temporal filter parameter; incremental sync has no effect for this resource"}`
+	const fullWarning = `{"event":"sync_warning","resource":"%s","reason":"resource_not_incremental","message":"endpoint has no usable incremental temporal filter; incremental sync has no effect for this resource"}`
 	assert.Contains(t, syncContent, fullWarning,
 		"warning event must preserve the full agent-facing JSON shape")
 	// Both syncResource (flat) and syncDependentResource (parameterized child
@@ -16458,7 +16473,7 @@ func TestGeneratedSyncGatesSinceParamPerResource(t *testing.T) {
 
 	// Human-mode warning to stderr — silent-fallback guard for TTY users.
 	assert.Contains(t, syncContent,
-		`"  %s: incremental sync ignored (endpoint declares no temporal filter; falling back to full pagination)\n"`,
+		`"  %s: incremental sync ignored (endpoint has no usable incremental temporal filter; falling back to full pagination)\n"`,
 		"human-mode users must see a stderr warning when --since is dropped")
 
 	// Zeroing the temporal-filter timestamp is what actually prevents the
@@ -22521,6 +22536,9 @@ paths:
         - name: start_date
           in: query
           schema: {type: string, format: date}
+        - name: end_date
+          in: query
+          schema: {type: string, format: date}
         - name: next_token
           in: query
           schema: {type: string}
@@ -22536,6 +22554,9 @@ paths:
       operationId: get_heartrate
       parameters:
         - name: start_datetime
+          in: query
+          schema: {type: string, format: date-time}
+        - name: end_datetime
           in: query
           schema: {type: string, format: date-time}
         - name: next_token
@@ -22663,6 +22684,8 @@ components:
 		"single-object resources without cursor params must not be marked paginated")
 	assert.Contains(t, src, `cursorParam:    "next_token"`,
 		"the generated sync layer must derive the API cursor param instead of hardcoding after")
+	assert.NotContains(t, src, `"time/tzdata"`,
+		"a date window with no named zone must not embed the zone database")
 
 	sinceFormatTest := `package cli
 

@@ -30,7 +30,7 @@ import (
 {{- if or $hasCookieBrowserAuth $hasBrowserCapture}}
 	"encoding/json"
 {{- end}}
-{{- if $hasBrowserCapture}}
+{{- if or $hasBrowserCapture (eq .Auth.Type "composed")}}
 	"errors"
 {{- end}}
 	"fmt"
@@ -59,7 +59,7 @@ import (
 	"strings"
 	"time"
 
-{{- if or .Auth.RequiresBrowserSession .Auth.HasCookies (and (eq .Auth.Type "composed") .UsesBrowserHTTPTransport)}}
+{{- if or .Auth.RequiresBrowserSession .Auth.HasCookies (eq .Auth.Type "composed")}}
 	"{{modulePath}}/internal/client"
 {{- end}}
 {{- if or (not (eq .Auth.Type "none")) $hasQueryRefresh (not .UsesBrowserManagedUserAgent)}}
@@ -245,6 +245,7 @@ profile by name when the installed backend supports it.`,
 					fmt.Fprintln(w, "Falling back to other extraction methods.")
 					fmt.Fprintln(w, "If you haven't logged in yet, run:")
 					fmt.Fprintf(w, "\n  press-auth login %s --login-url <login-url>\n\n", domain)
+					fmt.Fprintln(w, hostOnlySubdomainRecapture(domain, ""))
 				}
 			}
 			}
@@ -325,18 +326,17 @@ profile by name when the installed backend supports it.`,
 			requiredCookies := []string{ {{- range $i, $c := .Auth.Cookies}}{{if $i}}, {{end}}"{{$c}}"{{- end}} }
 
 			// Check if all required cookies were found on disk
-			allFound := true
+			var missing []string
 			for _, name := range requiredCookies {
 				if _, ok := cookieMap[name]; !ok {
-					allFound = false
-					break
+					missing = append(missing, name)
 				}
 			}
 
 			// If required cookies are missing, they may be session cookies
 			// (in-memory only, not written to Chrome's cookie DB).
 			// Try reading them from a live Chrome session via browser tools.
-			if !allFound {
+			if len(missing) > 0 {
 				fmt.Fprintf(w, "Required cookies not in Chrome's cookie DB (likely session cookies).\n")
 				fmt.Fprintf(w, "Attempting to read from live Chrome session...\n")
 
@@ -352,7 +352,12 @@ profile by name when the installed backend supports it.`,
 					fmt.Fprintln(w, "If this keeps failing, install a browser tool:")
 					fmt.Fprintln(w, "  pip install browser-use        # or")
 					fmt.Fprintln(w, "  npm install -g agent-browser")
-					return authErr(fmt.Errorf("session cookies not accessible for %s", domain))
+					// Retrying auth login reads the same press-auth capture that
+					// omitted a host-only subdomain cookie, so name the recapture.
+					for _, name := range missing {
+						fmt.Fprintln(w, hostOnlySubdomainRecapture(domain, name))
+					}
+					return authErr(fmt.Errorf("session cookies not accessible for %s; %s", domain, hostOnlySubdomainRecapture(domain, missing[0])))
 				}
 
 				// Merge live cookies into the map
@@ -369,7 +374,8 @@ profile by name when the installed backend supports it.`,
 						fmt.Fprintf(w, "\n  %s\n\n", loginURL)
 						fmt.Fprintln(w, "Then run this command again:")
 						fmt.Fprintf(w, "\n  {{.Name}}-pp-cli auth login --chrome\n")
-						return authErr(fmt.Errorf("cookie %q not found for %s", name, domain))
+						fmt.Fprintln(w, hostOnlySubdomainRecapture(domain, name))
+						return authErr(fmt.Errorf("cookie %q not found for %s; %s", name, domain, hostOnlySubdomainRecapture(domain, name)))
 					}
 				}
 				fmt.Fprintf(w, "%s Found session cookies via live Chrome.\n", green("OK"))
@@ -380,7 +386,22 @@ profile by name when the installed backend supports it.`,
 
 {{- if not .Auth.RequiresBrowserSession}}
 			fmt.Fprintf(w, "Validating session...")
-			if err := validateComposedAuthProbe(composed, validationCookies, !skipValidation); err != nil {
+			{
+			cfg, err := config.Load(flags.configPath)
+			if err != nil {
+				return configErr(err)
+			}
+			flags.applyTLSFlags(cfg)
+{{- if .UsesBrowserHTTPTransport}}
+			if flags.insecure {
+				cfg.SetSkipTLSVerify(true)
+			}
+{{- end}}
+			if err := validateComposedAuthProbe(composed, validationCookies, !skipValidation, cfg); err != nil {
+				if cfgErr := preservedConfigErr(err); cfgErr != nil {
+					fmt.Fprintf(w, " %s\n", red("failed"))
+					return cfgErr
+				}
 				loginURL := "https://" + strings.TrimPrefix(domain, ".")
 				fmt.Fprintf(w, " %s\n", red("expired"))
 				fmt.Fprintln(w, "")
@@ -394,6 +415,7 @@ profile by name when the installed backend supports it.`,
 					fmt.Fprintf(w, "\n  {{.Name}}-pp-cli auth login --chrome --skip-validation\n")
 				}
 				return authErr(fmt.Errorf("session expired for %s", domain))
+			}
 			}
 			if skipValidation {
 				fmt.Fprintf(w, " %s (origin probe skipped)\n", green("ok"))
@@ -441,6 +463,9 @@ profile by name when the installed backend supports it.`,
 {{- end}}
 				_ = clearBrowserSessionProof(cfg)
 				fmt.Fprintf(w, " %s\n", red("failed"))
+				if cfgErr := preservedConfigErr(err); cfgErr != nil {
+					return cfgErr
+				}
 				return authErr(fmt.Errorf("browser session validation failed: %w", err))
 			}
 			fmt.Fprintf(w, " %s\n", green("valid"))
@@ -468,7 +493,8 @@ profile by name when the installed backend supports it.`,
 					fmt.Fprintf(w, "\n  %s\n\n", loginURL)
 					fmt.Fprintln(w, "Then run this command again:")
 					fmt.Fprintf(w, "\n  {{.Name}}-pp-cli auth login --chrome\n")
-					return authErr(fmt.Errorf("cookie %q not found for %s", name, domain))
+					fmt.Fprintln(w, hostOnlySubdomainRecapture(domain, name))
+					return authErr(fmt.Errorf("cookie %q not found for %s; %s", name, domain, hostOnlySubdomainRecapture(domain, name)))
 				}
 				kept = append(kept, name+"="+v)
 			}
@@ -514,6 +540,9 @@ profile by name when the installed backend supports it.`,
 {{- end}}
 				_ = clearBrowserSessionProof(cfg)
 				fmt.Fprintf(w, " %s\n", red("failed"))
+				if cfgErr := preservedConfigErr(err); cfgErr != nil {
+					return cfgErr
+				}
 				return authErr(fmt.Errorf("browser session validation failed: %w", err))
 			}
 			fmt.Fprintf(w, " %s\n", green("valid"))
@@ -807,6 +836,9 @@ func newAuthRefreshCmd(flags *rootFlags) *cobra.Command {
 			fmt.Fprintf(w, "Validating browser session...")
 			if err := validateAndWriteBrowserSessionProofWithRetry(cmd.Context(), cfg, flags, waitTimeout); err != nil {
 				fmt.Fprintf(w, " %s\n", red("failed"))
+				if cfgErr := preservedConfigErr(err); cfgErr != nil {
+					return cfgErr
+				}
 				return authErr(fmt.Errorf("browser session validation failed: %w", err))
 			}
 			fmt.Fprintf(w, " %s\n", green("valid"))
@@ -1058,7 +1090,7 @@ func refreshStoredBrowserCookies(cfg *config.Config, w io.Writer) error {
 	requiredCookies := []string{ {{- range $i, $c := .Auth.Cookies}}{{if $i}}, {{end}}"{{$c}}"{{- end}} }
 	for _, name := range requiredCookies {
 		if _, ok := cookieMap[name]; !ok {
-			return fmt.Errorf("cookie %q not found for %s", name, domain)
+			return fmt.Errorf("cookie %q not found for %s; %s", name, domain, hostOnlySubdomainRecapture(domain, name))
 		}
 	}
 	composed := composeAuthFromCookies("{{.Auth.Format}}", requiredCookies, cookieMap)
@@ -1092,7 +1124,7 @@ func refreshStoredBrowserCookies(cfg *config.Config, w io.Writer) error {
 	for _, name := range requiredCookies {
 		v, ok := cookieMap[name]
 		if !ok {
-			return fmt.Errorf("cookie %q not found for %s", name, domain)
+			return fmt.Errorf("cookie %q not found for %s; %s", name, domain, hostOnlySubdomainRecapture(domain, name))
 		}
 		kept = append(kept, name+"="+v)
 	}
@@ -1527,6 +1559,18 @@ func newAuthLogoutCmd(flags *rootFlags) *cobra.Command {
 			return nil
 		},
 	}
+}
+
+// hostOnlySubdomainRecapture tells the operator how to recapture a cookie
+// that press-auth's default RFC 6265 filter drops. An empty name is the
+// hint printed when press-auth itself has not captured a session yet. A
+// named hint replaces an existing apex capture, so it passes --force;
+// without that, login refuses to open Chrome.
+func hostOnlySubdomainRecapture(domain, name string) string {
+	if name == "" {
+		return fmt.Sprintf("If a required cookie is host-only on a subdomain of %s, add --include-subdomains.", domain)
+	}
+	return fmt.Sprintf("If %q is host-only on a subdomain of %s, recapture with: press-auth login %s --login-url <login-url> --include-subdomains --force", name, domain, domain)
 }
 
 // --- Chrome profile discovery ---
@@ -2249,6 +2293,24 @@ func extractViaCookieScoop(domain, profileDir string) (string, error) {
 }
 {{- end}}
 
+{{- if or (eq .Auth.Type "composed") .Auth.RequiresBrowserSession}}
+// ExitCode reports the outer cliError, so wrapping this in authErr would
+// turn a bad CA bundle into an authentication failure.
+func preservedConfigErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	var typed *cliError
+	if errors.As(err, &typed) && typed.code == 10 {
+		return err
+	}
+	if errors.Is(err, client.ErrTLSConfig) {
+		return configErr(err)
+	}
+	return nil
+}
+{{- end}}
+
 {{- if eq .Auth.Type "composed"}}
 func cookieNameLooksCSRF(name string) bool {
 	n := strings.ToLower(strings.TrimSpace(name))
@@ -2294,10 +2356,10 @@ func composeCookieHeader(requiredCookies []string, cookieMap map[string]string) 
 // validateComposedAuth rejects expired JWTs locally before falling back to a
 // lightweight probe for opaque composed credentials.
 func validateComposedAuth(authHeader, cookieHeader string) error {
-	return validateComposedAuthProbe(authHeader, cookieHeader, true)
+	return validateComposedAuthProbe(authHeader, cookieHeader, true, nil)
 }
 
-func validateComposedAuthProbe(authHeader, cookieHeader string, probeOrigin bool) error {
+func validateComposedAuthProbe(authHeader, cookieHeader string, probeOrigin bool, cfg *config.Config) error {
 	for _, credential := range []string{authHeader, cookieHeader} {
 		if expiry, ok := composedAuthJWTExpiry(credential); ok {
 			if !time.Now().Before(expiry) {
@@ -2345,10 +2407,13 @@ func validateComposedAuthProbe(authHeader, cookieHeader string, probeOrigin bool
 {{- end}}
 
 {{- if .UsesBrowserHTTPTransport}}
-	httpClient := client.NewProbeHTTPClient(5*time.Second, false)
+	httpClient, err := client.NewProbeHTTPClient(5*time.Second, cfg)
 {{- else}}
-	httpClient := client.NewPlainHTTPClient(5 * time.Second)
+	httpClient, err := client.NewPlainHTTPClient(5*time.Second, cfg)
 {{- end}}
+	if err != nil {
+		return err
+	}
 	req, err = client.PrepareRequest(httpClient, req)
 	if err != nil {
 		return err
@@ -2535,7 +2600,16 @@ func validateAndWriteBrowserSessionProof(ctx context.Context, cfg *config.Config
 		return fmt.Errorf("no browser session credentials were saved")
 	}
 
+	flags.applyTLSFlags(cfg)
+{{- if .UsesBrowserHTTPTransport}}
+	if flags.insecure {
+		cfg.SetSkipTLSVerify(true)
+	}
+{{- end}}
 	c := client.New(cfg, flags.timeout, flags.rateLimit)
+	if tlsErr := c.TLSConfigError(); tlsErr != nil {
+		return configErr(tlsErr)
+	}
 	c.NoCache = true
 	status, err := c.ProbeGet(ctx, validationPath)
 	if err != nil {
@@ -2569,6 +2643,9 @@ func validateAndWriteBrowserSessionProofWithRetry(ctx context.Context, cfg *conf
 	var lastErr error
 	for {
 		if err := validateAndWriteBrowserSessionProof(ctx, cfg, flags); err != nil {
+			if cfgErr := preservedConfigErr(err); cfgErr != nil {
+				return cfgErr
+			}
 			lastErr = err
 		} else {
 			return nil

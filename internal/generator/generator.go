@@ -3038,7 +3038,9 @@ func (g *Generator) renderSingleFiles() error {
 		"cliutil_filelock.go.tmpl":                 filepath.Join("internal", "cliutil", "filelock.go"),
 		"cliutil_filelock_unix.go.tmpl":            filepath.Join("internal", "cliutil", "filelock_unix.go"),
 		"cliutil_filelock_windows.go.tmpl":         filepath.Join("internal", "cliutil", "filelock_windows.go"),
+		"cliutil_windows_account.go.tmpl":          filepath.Join("internal", "cliutil", "windows_account.go"),
 		"cliutil_filelock_test.go.tmpl":            filepath.Join("internal", "cliutil", "filelock_test.go"),
+		"cliutil_creds_perms_eval.go.tmpl":         filepath.Join("internal", "cliutil", "creds_perms_eval.go"),
 		"cliutil_darwin_acl.go.tmpl":               filepath.Join("internal", "cliutil", "darwin_acl.go"),
 		"cliutil_darwin_acl_darwin.go.tmpl":        filepath.Join("internal", "cliutil", "darwin_acl_darwin.go"),
 		"cliutil_darwin_acl_test.go.tmpl":          filepath.Join("internal", "cliutil", "darwin_acl_test.go"),
@@ -3211,12 +3213,8 @@ func (g *Generator) renderOptionalSupportFiles() error {
 		}
 		// Read-time credentials permission check (S1): a persisted token file
 		// written 0600 can later drift to loose perms, so guard it at load time.
-		// Emitted alongside credentials because it only matters when a token is
-		// persisted. Pure evaluator is build-tag-free (unit-testable anywhere);
-		// the POSIX and Windows guards are platform-gated.
-		if err := g.renderTemplate("cliutil_creds_perms_eval.go.tmpl", filepath.Join("internal", "cliutil", "creds_perms_eval.go"), authData); err != nil {
-			return fmt.Errorf("rendering cliutil creds perms evaluator: %w", err)
-		}
+		// The evaluator itself is always emitted so a loose config file can
+		// share the same DACL verdict. These platform guards stay with auth.
 		if err := g.renderTemplate("cliutil_creds_perms_eval_test.go.tmpl", filepath.Join("internal", "cliutil", "creds_perms_eval_test.go"), authData); err != nil {
 			return fmt.Errorf("rendering cliutil creds perms evaluator test: %w", err)
 		}
@@ -3670,6 +3668,7 @@ func shouldSanitizeCapturedResourceIDs(apiSpec *spec.APISpec) bool {
 
 func (g *Generator) Generate() error {
 	sanitizeCapturedResourceIDsForGenerate(g.Spec)
+	g.Spec.ApplyOmittedConfigDefaults()
 	// CanonicalEnvVar fills EnvVarSpecs as a side effect. Single-file templates
 	// render in map order, so an env_vars-only spec otherwise emits different
 	// config depending on which file runs first.
@@ -3966,6 +3965,7 @@ func cobratreeWalkerTemplateFiles() map[string]string {
 // emitted when the spec opts out.
 func (g *Generator) GenerateMCPSurface() error {
 	sanitizeCapturedResourceIDsForGenerate(g.Spec)
+	g.Spec.ApplyOmittedConfigDefaults()
 	applyLargeMCPSurfaceDefault(g.Spec, os.Stderr)
 	if err := g.prepareOutput(); err != nil {
 		return err
@@ -3994,7 +3994,9 @@ func (g *Generator) GenerateMCPSurface() error {
 		"cliutil_filelock.go.tmpl":                filepath.Join("internal", "cliutil", "filelock.go"),
 		"cliutil_filelock_unix.go.tmpl":           filepath.Join("internal", "cliutil", "filelock_unix.go"),
 		"cliutil_filelock_windows.go.tmpl":        filepath.Join("internal", "cliutil", "filelock_windows.go"),
+		"cliutil_windows_account.go.tmpl":         filepath.Join("internal", "cliutil", "windows_account.go"),
 		"cliutil_filelock_test.go.tmpl":           filepath.Join("internal", "cliutil", "filelock_test.go"),
+		"cliutil_creds_perms_eval.go.tmpl":        filepath.Join("internal", "cliutil", "creds_perms_eval.go"),
 		"cliutil_darwin_acl.go.tmpl":              filepath.Join("internal", "cliutil", "darwin_acl.go"),
 		"cliutil_darwin_acl_darwin.go.tmpl":       filepath.Join("internal", "cliutil", "darwin_acl_darwin.go"),
 		"cliutil_darwin_acl_test.go.tmpl":         filepath.Join("internal", "cliutil", "darwin_acl_test.go"),
@@ -4610,7 +4612,10 @@ func (g *Generator) emitsConcurrentTokenRaceTest() bool {
 // client.go emits mintClientCredentials — and a compile-time reference to
 // OAuthTokenHTTPClient — for every client_credentials grant, including
 // specs with an empty TokenURL. TokenURL and AuthorizationURL cover the
-// other call sites (refresh, auth-code exchange, device poll).
+// other call sites (refresh, auth-code exchange, device poll). Google
+// service-account exchange references it even when the spec TokenURL is
+// empty: the key's token_uri is still fetched through the API transport,
+// and that client's redirect callback must not re-enter auth.
 func (g *Generator) hasOAuthTokenExchange() bool {
 	if g == nil || g.Spec == nil {
 		return false
@@ -4618,7 +4623,8 @@ func (g *Generator) hasOAuthTokenExchange() bool {
 	auth := g.Spec.Auth
 	return strings.TrimSpace(auth.TokenURL) != "" ||
 		strings.TrimSpace(auth.AuthorizationURL) != "" ||
-		auth.EffectiveOAuth2Grant() == spec.OAuth2GrantClientCredentials
+		auth.EffectiveOAuth2Grant() == spec.OAuth2GrantClientCredentials ||
+		auth.Subtype == spec.AuthSubtypeGoogleServiceAccount
 }
 
 func (g *Generator) emitsTopLevelOAuthLogin() bool {
@@ -4887,6 +4893,11 @@ type visionRenderData struct {
 	AgentMoneyWorkflow           AgentMoneyWorkflow
 	HTMLSyncStub                 bool
 	HTMLPageModeResources        []criticalResourceEntry
+	// SyncSinceNeedsTZData is true when a since value is rewritten into a
+	// named zone. The sync template blank-imports time/tzdata only then, so
+	// Windows and minimal images can load the zone and other CLIs do not
+	// embed the zone database.
+	SyncSinceNeedsTZData bool
 }
 
 type resourceIDFieldOverrideEntry struct {
@@ -5483,13 +5494,16 @@ func (g *Generator) visionRenderData(schema []TableDef) visionRenderData {
 		}
 	}
 
+	syncable := withEffectiveSyncableRequestPaths(g.Spec, g.profile.SyncableResources)
+	dependent := withEffectiveDependentRequestPaths(g.Spec, g.profile.DependentSyncResources)
 	return visionRenderData{
 		APISpec:                      g.Spec,
 		VisionSet:                    g.VisionSet,
 		CommandNames:                 maps.Clone(g.visionCommandNames),
 		HasSync:                      g.hasGeneratedSyncImplementation(),
-		SyncableResources:            withEffectiveSyncableRequestPaths(g.Spec, g.profile.SyncableResources),
-		DependentSyncResources:       withEffectiveDependentRequestPaths(g.Spec, g.profile.DependentSyncResources),
+		SyncableResources:            syncable,
+		DependentSyncResources:       dependent,
+		SyncSinceNeedsTZData:         syncSinceFormatsNeedTZData(syncable, dependent),
 		SyncResourcesExample:         syncResourcesExample(g.profile.SyncableResources, g.profile.DependentSyncResources),
 		TenantScopedParents:          g.profile.TenantScopedParents(),
 		MembershipScopedParents:      g.profile.MembershipScopedParents(),
@@ -5510,6 +5524,20 @@ func (g *Generator) visionRenderData(schema []TableDef) visionRenderData {
 		HTMLSyncStub:                 g.htmlSyncStubSelected,
 		HTMLPageModeResources:        htmlPageModeResourceEntries(g.Spec, g.profile.SyncableResources, g.profile.DependentSyncResources),
 	}
+}
+
+func syncSinceFormatsNeedTZData(syncable []profiler.SyncableResource, dependent []profiler.DependentResource) bool {
+	for _, resource := range syncable {
+		if strings.HasPrefix(resource.SinceParamFormat, "local-datetime:") {
+			return true
+		}
+	}
+	for _, resource := range dependent {
+		if strings.HasPrefix(resource.SinceParamFormat, "local-datetime:") {
+			return true
+		}
+	}
+	return false
 }
 
 func searchResponsePaths(apiSpec *spec.APISpec, searchEndpointPath, searchEndpointMethod string) []string {
