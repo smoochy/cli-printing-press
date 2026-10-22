@@ -10,6 +10,18 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestLiveDBEnabled(t *testing.T) {
+	t.Parallel()
+
+	assert.False(t, liveDBEnabled("", true))
+	assert.False(t, liveDBEnabled("0", true))
+	assert.False(t, liveDBEnabled("true", true))
+	assert.True(t, liveDBEnabled("1", true))
+	assert.True(t, liveDBEnabled("", false))
+	assert.True(t, liveDBEnabled("0", false))
+	assert.True(t, liveDBEnabled("1", false))
+}
+
 func TestToolModuleIsPinned(t *testing.T) {
 	assert.NotContains(t, ToolModule, "@latest")
 	assert.True(t, strings.HasPrefix(ToolVersion, "v"))
@@ -25,16 +37,16 @@ func TestGoRunArgsUsesDefaultMode(t *testing.T) {
 
 func TestToolchainEnvPrefersToolchainDirective(t *testing.T) {
 	dir := t.TempDir()
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module example.com/test\n\ngo 1.25.0\ntoolchain go1.26.9\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module example.com/test\n\ngo 1.25.0\ntoolchain go1.26.10\n"), 0o644))
 
-	assert.Equal(t, []string{"GOTOOLCHAIN=go1.26.9"}, ToolchainEnv(dir))
+	assert.Equal(t, []string{"GOTOOLCHAIN=go1.26.10"}, ToolchainEnv(dir))
 }
 
 func TestToolchainEnvFallsBackToPatchLevelGoDirective(t *testing.T) {
 	dir := t.TempDir()
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module example.com/test\n\ngo 1.26.9\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module example.com/test\n\ngo 1.26.10\n"), 0o644))
 
-	assert.Equal(t, []string{"GOTOOLCHAIN=go1.26.9"}, ToolchainEnv(dir))
+	assert.Equal(t, []string{"GOTOOLCHAIN=go1.26.10"}, ToolchainEnv(dir))
 }
 
 func TestToolchainEnvIgnoresLanguageOnlyGoDirective(t *testing.T) {
