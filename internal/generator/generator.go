@@ -458,6 +458,7 @@ func New(s *spec.APISpec, outputDir string) *Generator {
 		"bodyHasStringBackedBool":             bodyHasStringBackedBool,
 		"multipartBodyMaps":                   multipartBodyMaps,
 		"endpointUsesMultipart":               endpointUsesMultipart,
+		"isBinaryParam":                       isBinaryParam,
 		"endpointHasJSONBody":                 endpointHasJSONBody,
 		"endpointReplaySafe":                  endpointReplaySafe,
 		"endpointUsesRawRequest":              endpointUsesRawRequest,
@@ -10330,7 +10331,24 @@ func (g *Generator) mcpParamDescription(p spec.Param) string {
 	if g.mcpParamDescriptions == nil {
 		g.mcpParamDescriptions = mcpdesc.NewParamDescriptionCompactor(g.Spec)
 	}
-	return naming.OneLine(g.mcpParamDescriptions.Description(p)) + serverDefaultHint(p)
+	desc := naming.OneLine(g.mcpParamDescriptions.Description(p)) + serverDefaultHint(p)
+	if isBinaryParam(p) {
+		// A multipart binary param is not literally a "File" over MCP: the
+		// typed tool takes base64-encoded content, and only accepts a local
+		// path when the operator opts into the confined upload root. Spell
+		// that out so an agent does not pass a filesystem path by default.
+		note := "base64-encoded file content (a filesystem path is accepted only when " + naming.EnvPrefix(g.Spec.Name) + "_MCP_UPLOAD_ROOT is set)"
+		desc = strings.TrimSpace(desc)
+		switch {
+		case desc == "":
+			desc = note
+		case strings.HasSuffix(desc, "."):
+			desc += " " + note
+		default:
+			desc += ". " + note
+		}
+	}
+	return desc
 }
 
 func exampleValue(p spec.Param) string {

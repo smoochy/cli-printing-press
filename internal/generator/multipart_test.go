@@ -86,7 +86,27 @@ func TestGenerateMultipartRequestBodyUsesMultipartClient(t *testing.T) {
 	assert.Contains(t, mcpSrc, `makeAPIHandler("POST", "/assets", false, false, nil, mcpPageConfig{}, []mcpParamBinding`)
 	assert.Contains(t, mcpSrc, `Format: "binary"`)
 	assert.Contains(t, mcpSrc, `RequestContentType: "multipart/form-data"`)
-	assert.Contains(t, mcpSrc, `multipartFileFields[binding.WireName] = fmt.Sprintf("%v", v)`)
+	// Binary multipart params over MCP are routed through the confinement
+	// resolver (base64 content by default, opt-in os.Root path mode) rather
+	// than passed straight to the client as a raw caller-supplied path. This
+	// locks out the regression where an MCP caller could name an arbitrary
+	// local file for the server to read (CWE-22/CWE-73).
+	assert.Contains(t, mcpSrc, `stagedPath, cleanupUpload, uploadErr := resolveMCPMultipartFile(binding.WireName, filenameHint, v)`)
+	assert.Contains(t, mcpSrc, `multipartFileFields[binding.WireName] = stagedPath`)
+	assert.NotContains(t, mcpSrc, `multipartFileFields[binding.WireName] = fmt.Sprintf("%v", v)`)
+	assert.Contains(t, mcpSrc, `func resolveMCPMultipartFile(field, filenameHint string, v any) (string, func(), error)`)
+	// The optional companion filename arg is declared in the tool schema and
+	// registered as a known arg, and a decoded payload is bounded by a size cap.
+	assert.Contains(t, mcpSrc, `mcplib.WithString("assetData_filename"`)
+	assert.Contains(t, mcpSrc, `knownArgs[binding.PublicName+"_filename"] = true`)
+	assert.Contains(t, mcpSrc, `const mcpMaxUploadBytes =`)
+	// The opt-in path mode is a dedicated helper that opens once through
+	// os.Root, requires a regular file, and bounds the read with io.LimitReader;
+	// the base64 default rejects an over-cap payload before decoding it.
+	assert.Contains(t, mcpSrc, `func resolveMCPUploadFromRoot(field, root, raw string) (string, func(), error)`)
+	assert.Contains(t, mcpSrc, `io.LimitReader(f, mcpMaxUploadBytes+1)`)
+	assert.Contains(t, mcpSrc, `base64.StdEncoding.EncodedLen(mcpMaxUploadBytes)`)
+	assert.Contains(t, mcpSrc, `raw, ok := v.(string)`)
 	assert.Contains(t, mcpSrc, `data, _, err = c.PostMultipartWithParams(ctx, path, params, multipartFields, multipartFileFields)`)
 
 	// An object/array body param binds to its native JSON type even on a
@@ -453,4 +473,205 @@ func TestGenerateBinaryResponseWritesRawBytes(t *testing.T) {
 	endpointSrc := readGeneratedFile(t, outputDir, "internal", "cli", "promoted_audio.go")
 	assert.Contains(t, endpointSrc, `binary response cannot be rendered as structured output`)
 	assert.Contains(t, endpointSrc, `cmd.OutOrStdout().Write(data)`)
+}
+
+// TestMCPMultipartFileParamConfinement locks the MCP multipart file-read
+// hardening end to end: the generated resolveMCPMultipartFile accepts base64
+// file content by default (so an MCP caller cannot name an arbitrary local
+// path for the server to read), and in the opt-in upload-root mode it confines
+// reads to the configured directory, refusing traversal, absolute paths, and
+// symlinks (CWE-22/CWE-73).
+func TestMCPMultipartFileParamConfinement(t *testing.T) {
+	t.Parallel()
+
+	apiSpec := minimalSpec("uploadconfine")
+	apiSpec.Resources = map[string]spec.Resource{
+		"assets": {
+			Description: "Manage assets",
+			Endpoints: map[string]spec.Endpoint{
+				"upload": {
+					Method:             "POST",
+					Path:               "/assets",
+					Description:        "Upload an asset",
+					RequestContentType: "multipart/form-data",
+					Body: []spec.Param{
+						{Name: "file", Type: "string", Format: "binary", Required: true, Description: "Asset file"},
+						{Name: "label", Type: "string", Description: "Label"},
+					},
+				},
+			},
+		},
+	}
+
+	outputDir := filepath.Join(t.TempDir(), naming.CLI(apiSpec.Name))
+	require.NoError(t, New(apiSpec, outputDir).Generate())
+
+	runtimeTest := `package mcp
+
+import (
+	"encoding/base64"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestResolveMCPMultipartFile_Base64Default(t *testing.T) {
+	path, cleanup, err := resolveMCPMultipartFile("file", "", base64.StdEncoding.EncodeToString([]byte("HELLO")))
+	if err != nil {
+		t.Fatalf("base64 content rejected: %v", err)
+	}
+	defer cleanup()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read staged: %v", err)
+	}
+	if string(b) != "HELLO" {
+		t.Fatalf("staged = %q, want HELLO", b)
+	}
+	if filepath.Base(path) != "file" {
+		t.Fatalf("default filename = %q, want the parameter name \"file\"", filepath.Base(path))
+	}
+}
+
+func TestResolveMCPMultipartFile_FilenameHint(t *testing.T) {
+	// A usable hint becomes the multipart filename so a server can sniff by
+	// extension.
+	path, cleanup, err := resolveMCPMultipartFile("file", "photo.png", base64.StdEncoding.EncodeToString([]byte("IMG")))
+	if err != nil {
+		t.Fatalf("hint rejected: %v", err)
+	}
+	cleanup()
+	if filepath.Base(path) != "photo.png" {
+		t.Fatalf("filename = %q, want photo.png", filepath.Base(path))
+	}
+
+	// Unsafe hints are rejected and fall back to the parameter name.
+	for _, bad := range []string{"", ".", "..", "a/b.png", "a\\b.png", "x\x00y", "a:b.png", "\u202eevil.png", strings.Repeat("x", 300) + ".png"} {
+		p, c, err := resolveMCPMultipartFile("file", bad, base64.StdEncoding.EncodeToString([]byte("Z")))
+		if err != nil {
+			t.Fatalf("content with bad hint %q rejected: %v", bad, err)
+		}
+		if filepath.Base(p) != "file" {
+			t.Fatalf("bad hint %q produced filename %q, want fallback \"file\"", bad, filepath.Base(p))
+		}
+		c()
+	}
+}
+
+func TestResolveMCPMultipartFile_RejectsRawPathByDefault(t *testing.T) {
+	_, _, err := resolveMCPMultipartFile("file", "", "/etc/passwd")
+	if err == nil {
+		t.Fatal("default mode accepted a raw local path instead of base64 content")
+	}
+	// The error must name the opt-in env var and the base64 alternative.
+	if !strings.Contains(err.Error(), mcpUploadRootEnvVar) {
+		t.Fatalf("error %q does not name %s", err, mcpUploadRootEnvVar)
+	}
+	if !strings.Contains(err.Error(), "base64") {
+		t.Fatalf("error %q does not mention base64", err)
+	}
+}
+
+func TestResolveMCPMultipartFile_SizeCap(t *testing.T) {
+	big := make([]byte, mcpMaxUploadBytes+1)
+	if _, _, err := resolveMCPMultipartFile("file", "", base64.StdEncoding.EncodeToString(big)); err == nil {
+		t.Fatal("default mode accepted a payload over the size cap")
+	}
+}
+
+func TestResolveMCPMultipartFile_RequiresString(t *testing.T) {
+	// A non-string MCP value is rejected rather than coerced via fmt, so a
+	// number or object cannot slip into the base64 decoder or the path resolver.
+	if _, _, err := resolveMCPMultipartFile("file", "", 123); err == nil {
+		t.Fatal("non-string multipart value was accepted")
+	}
+}
+
+func TestResolveMCPMultipartFile_RejectsOversizeBase64BeforeDecode(t *testing.T) {
+	// A base64 payload whose length alone exceeds the cap is rejected before any
+	// decode allocation happens.
+	huge := strings.Repeat("A", base64.StdEncoding.EncodedLen(mcpMaxUploadBytes)+5000)
+	if _, _, err := resolveMCPMultipartFile("file", "", huge); err == nil {
+		t.Fatal("oversize base64 payload was accepted")
+	}
+}
+
+func TestResolveMCPMultipartFile_RootModeConfines(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "ok.bin"), []byte("INSIDE"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(mcpUploadRootEnvVar, root)
+
+	path, cleanup, err := resolveMCPMultipartFile("file", "ignored.txt", "ok.bin")
+	if err != nil {
+		t.Fatalf("in-root relative path rejected: %v", err)
+	}
+	b, _ := os.ReadFile(path)
+	// Path mode derives the filename from the confined path, ignoring the hint.
+	if filepath.Base(path) != "ok.bin" {
+		t.Fatalf("path-mode filename = %q, want ok.bin", filepath.Base(path))
+	}
+	cleanup()
+	if string(b) != "INSIDE" {
+		t.Fatalf("staged = %q, want INSIDE", b)
+	}
+
+	if _, _, err := resolveMCPMultipartFile("file", "", "../escape"); err == nil {
+		t.Fatal("root mode accepted a traversal path")
+	}
+	if _, _, err := resolveMCPMultipartFile("file", "", "/etc/passwd"); err == nil {
+		t.Fatal("root mode accepted an absolute path outside the root")
+	}
+
+	outside := filepath.Join(t.TempDir(), "secret")
+	if err := os.WriteFile(outside, []byte("SECRET"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "link")); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	if _, _, err := resolveMCPMultipartFile("file", "", "link"); err == nil {
+		t.Fatal("root mode followed a symlink out of the root")
+	}
+
+	// A non-regular file inside the root (here a directory) is refused so a read
+	// cannot hang on a FIFO/device or pull in a directory.
+	if err := os.Mkdir(filepath.Join(root, "adir"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := resolveMCPMultipartFile("file", "", "adir"); err == nil {
+		t.Fatal("root mode accepted a non-regular file")
+	}
+
+	// An absolute path that still lives inside the root is accepted (made
+	// root-relative), so operators can pass a fully-qualified in-root path.
+	if err := os.WriteFile(filepath.Join(root, "ok2.bin"), []byte("ABS"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ap, ac, err := resolveMCPMultipartFile("file", "", filepath.Join(root, "ok2.bin"))
+	if err != nil {
+		t.Fatalf("absolute in-root path rejected: %v", err)
+	}
+	if ab, _ := os.ReadFile(ap); string(ab) != "ABS" {
+		t.Fatalf("absolute in-root read = %q, want ABS", ab)
+	}
+	ac()
+
+	// os.Root refuses a symlink whose target is an absolute path even when it
+	// resolves inside the root. That is conservative and safe: upload-root mode
+	// reads only real files placed directly under the root.
+	if err := os.Symlink(filepath.Join(root, "ok.bin"), filepath.Join(root, "inlink")); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	if _, _, err := resolveMCPMultipartFile("file", "", "inlink"); err == nil {
+		t.Fatal("root mode followed an absolute-target symlink inside the root")
+	}
+}
+`
+	require.NoError(t, os.WriteFile(filepath.Join(outputDir, "internal", "mcp", "multipart_confine_runtime_test.go"), []byte(runtimeTest), 0o600))
+	runGoCommand(t, outputDir, "mod", "tidy")
+	runGoCommandRequired(t, outputDir, "test", "./internal/mcp", "-run", "^TestResolveMCPMultipartFile_", "-count=1")
+	requireGeneratedCompiles(t, outputDir)
 }

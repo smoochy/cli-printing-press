@@ -6,7 +6,6 @@ package cli
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -175,7 +174,7 @@ func Execute() (retErr error) {
 	}
 	envelopeWriter := io.Writer(os.Stdout)
 	if flags.deliverBuf != nil {
-		envelopeWriter = io.MultiWriter(os.Stdout, flags.deliverBuf)
+		envelopeWriter = &mirrorWriter{primary: os.Stdout, copy: flags.deliverBuf}
 	}
 	envelopeWritten := writeCredentialSaveErrorEnvelope(envelopeWriter, &flags, err)
 	if envelopeWritten && flags.deliverBuf != nil {
@@ -240,13 +239,13 @@ func writeCredentialSaveErrorEnvelope(w io.Writer, flags *rootFlags, err error) 
 	if !errors.As(err, &permissionErr) {
 		return false
 	}
-	_ = json.NewEncoder(w).Encode(map[string]any{
+	_ = writeEncodedJSON(w, map[string]any{
 		"saved":                true,
 		"credentials_path":     permissionErr.Path,
 		"permissions_verified": false,
 		"error":                permissionErr.Error(),
 		"code":                 ExitCode(err),
-	})
+	}, "", "")
 	return true
 }
 
@@ -341,7 +340,7 @@ Run 'learn-disabled-example-pp-cli doctor' to verify auth and connectivity.`,
 	}
 
 	rootCmd.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
-		var appliedProfile *Profile
+		resetProfileAppliedFlags()
 		if err := enforceMCPBoundProfile(cmd, flags); err != nil {
 			return err
 		}
@@ -349,17 +348,6 @@ Run 'learn-disabled-example-pp-cli doctor' to verify auth and connectivity.`,
 			return err
 		}
 		configureDefaultDBScope(flags.configPath)
-		if flags.deliverSpec != "" {
-			sink, err := ParseDeliverSink(flags.deliverSpec)
-			if err != nil {
-				return err
-			}
-			flags.deliverSink = sink
-			if sink.Scheme != "stdout" && sink.Scheme != "" {
-				flags.deliverBuf = &bytes.Buffer{}
-				cmd.SetOut(io.MultiWriter(os.Stdout, flags.deliverBuf))
-			}
-		}
 		if flags.runProfileName != "" {
 			profile, err := GetProfile(flags.runProfileName)
 			if err != nil {
@@ -375,7 +363,20 @@ Run 'learn-disabled-example-pp-cli doctor' to verify auth and connectivity.`,
 			if err := ApplyProfileToFlags(cmd, profile); err != nil {
 				return err
 			}
-			appliedProfile = profile
+		}
+		// A saved --deliver has to be applied before the sink is chosen.
+		// profile save records the flag and prints a confirmation; wiring
+		// the sink would also write that confirmation to the destination.
+		if flags.deliverSpec != "" && !profileSaveSkipsDeliver(cmd) {
+			sink, err := ParseDeliverSink(flags.deliverSpec)
+			if err != nil {
+				return err
+			}
+			flags.deliverSink = sink
+			if sink.Scheme != "stdout" && sink.Scheme != "" {
+				flags.deliverBuf = &bytes.Buffer{}
+				cmd.SetOut(&mirrorWriter{primary: os.Stdout, copy: flags.deliverBuf})
+			}
 		}
 		// A saved profile can set dry-run after flag parse. Suppression has to
 		// see that value before any store path is resolved.
@@ -428,7 +429,7 @@ Run 'learn-disabled-example-pp-cli doctor' to verify auth and connectivity.`,
 				noColor = true
 			}
 		}
-		flags.timeoutExplicit = timeoutExplicitFrom(cmd, appliedProfile)
+		flags.timeoutExplicit = timeoutExplicitFrom(cmd)
 		flags.agentSource = declaredAgentSource(cmd, flags)
 		return nil
 	}
@@ -457,22 +458,17 @@ Run 'learn-disabled-example-pp-cli doctor' to verify auth and connectivity.`,
 		attachPlatformWhoamiCommand(rootCmd, flags)
 	}
 
+	if isTerminal(os.Stderr) {
+		rootCmd.SetErr(&terminalStreamFilter{w: rootCmd.ErrOrStderr()})
+	}
+
 	return rootCmd
 }
 
-// ApplyProfileToFlags overlays values without setting Flag.Changed, so a
-// profile-supplied timeout must count here or binary transfers would drop
-// the whole-call bound.
-func timeoutExplicitFrom(cmd *cobra.Command, profile *Profile) bool {
-	if cmd != nil && cmd.Flags().Changed("timeout") {
-		return true
-	}
-	if profile != nil {
-		if _, ok := profile.Values["timeout"]; ok {
-			return true
-		}
-	}
-	return false
+// ApplyProfileToFlags uses FlagSet.Set, so a saved timeout is Changed and
+// keeps the whole-call bound on binary transfers.
+func timeoutExplicitFrom(cmd *cobra.Command) bool {
+	return cmd != nil && cmd.Flags().Changed("timeout")
 }
 
 func ExitCode(err error) int {
@@ -527,13 +523,14 @@ func (f *rootFlags) printTable(w *cobra.Command, headers []string, rows [][]stri
 	if f.asJSON {
 		return fmt.Errorf("use printJSON for JSON output")
 	}
-	tw := tabwriter.NewWriter(w.OutOrStdout(), 2, 4, 2, ' ', 0)
+	out := w.OutOrStdout()
+	tw := tabwriter.NewWriter(out, 2, 4, 2, ' ', 0)
 	header := ""
 	for i, h := range headers {
 		if i > 0 {
 			header += "\t"
 		}
-		header += h
+		header += terminalText(out, h)
 	}
 	fmt.Fprintln(tw, header)
 	for _, row := range rows {
@@ -542,7 +539,7 @@ func (f *rootFlags) printTable(w *cobra.Command, headers []string, rows [][]stri
 			if i > 0 {
 				line += "\t"
 			}
-			line += cell
+			line += terminalText(out, cell)
 		}
 		fmt.Fprintln(tw, line)
 	}

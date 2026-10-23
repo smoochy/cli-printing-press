@@ -184,3 +184,278 @@ func TestShare_CommitIsNoOpWhenNothingChanged(t *testing.T) {
 		t.Fatalf("expected no commit on empty repo, got committed=true")
 	}
 }
+
+// TestShare_RejectsOptionLikeGitValues locks the git argument-injection
+// hardening: a remote/branch/repo value that git would parse as an option
+// (leading "-") is refused before any git invocation, so a crafted --remote
+// or --branch cannot smuggle flags like --upload-pack= or --config= into the
+// underlying git command.
+func TestShare_RejectsOptionLikeGitValues(t *testing.T) {
+	ctx := context.Background()
+	repoDir := filepath.Join(t.TempDir(), "repo")
+	cases := []struct {
+		name string
+		opts Options
+	}{
+		{"remote option injection", Options{RepoPath: repoDir, Remote: "--upload-pack=touch /tmp/pwned"}},
+		{"branch option injection", Options{RepoPath: repoDir, Remote: "https://example.invalid/r.git", Branch: "--output=/tmp/x"}},
+		{"repo path option injection", Options{RepoPath: "-repo", Remote: "https://example.invalid/r.git"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := EnsureRepo(ctx, tc.opts); err == nil {
+				t.Fatalf("EnsureRepo accepted option-like value: %+v", tc.opts)
+			}
+			if err := Pull(ctx, tc.opts); err == nil {
+				t.Fatalf("Pull accepted option-like value: %+v", tc.opts)
+			}
+			if err := Push(ctx, tc.opts); err == nil {
+				t.Fatalf("Push accepted option-like value: %+v", tc.opts)
+			}
+		})
+	}
+}
+
+// writeShareTestManifest writes a minimal valid manifest.json carrying the
+// supplied tables, for Import hardening tests.
+func writeShareTestManifest(t *testing.T, repoDir string, tables []TableManifest) {
+	t.Helper()
+	m := Manifest{
+		Version:       ManifestVersion,
+		CLIName:       "{{.Name}}-pp-cli",
+		SchemaVersion: store.StoreSchemaVersion,
+		Tables:        tables,
+	}
+	data, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal manifest: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, ManifestName), data, 0o600); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+}
+
+// TestShare_ImportRejectsNonLocalManifestFile locks the path-containment
+// hardening: a manifest whose table file escapes the repo (via "..") is
+// refused before any file is opened, so a hostile snapshot cannot make import
+// read an arbitrary local file (CWE-22).
+func TestShare_ImportRejectsNonLocalManifestFile(t *testing.T) {
+	if len(SnapshotTables) == 0 {
+		t.Skip("no snapshot tables configured")
+	}
+	ctx := context.Background()
+	dst := openStore(t)
+	repoDir := t.TempDir()
+	tables := []TableManifest{
+		{
+			Name:    SnapshotTables[0],
+			File:    "../../../../etc/passwd",
+			Columns: []string{"x"},
+			Rows:    1,
+		},
+	}
+	writeShareTestManifest(t, repoDir, tables)
+	if _, err := Import(ctx, dst, Options{RepoPath: repoDir}); err == nil {
+		t.Fatal("Import accepted a manifest table file that escapes the repo")
+	}
+}
+
+// TestShare_ImportRejectsNonAllowlistTable locks the table-allowlist
+// hardening: a manifest that names a table outside SnapshotTables is refused,
+// so a hostile snapshot cannot insert into arbitrary tables.
+func TestShare_ImportRejectsNonAllowlistTable(t *testing.T) {
+	ctx := context.Background()
+	dst := openStore(t)
+	repoDir := t.TempDir()
+	tables := []TableManifest{
+		{
+			Name:    "definitely_not_a_snapshot_table",
+			File:    "tables/x.jsonl",
+			Columns: []string{"x"},
+			Rows:    1,
+		},
+	}
+	writeShareTestManifest(t, repoDir, tables)
+	if _, err := Import(ctx, dst, Options{RepoPath: repoDir}); err == nil {
+		t.Fatal("Import accepted a manifest table outside the snapshot allowlist")
+	}
+}
+
+// TestShare_OpenRepoRegularFileConfines locks the shared read helper used by
+// Import and ReadManifest: it refuses path traversal and an escaping symlink
+// (os.Root), and a non-regular file, while still allowing a regular file and an
+// in-repo symlink that stays inside the repo (CWE-22/CWE-73).
+func TestShare_OpenRepoRegularFileConfines(t *testing.T) {
+	repoDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repoDir, "ok.txt"), []byte("OK"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := openRepoRegularFile(repoDir, "ok.txt")
+	if err != nil {
+		t.Fatalf("regular in-repo file rejected: %v", err)
+	}
+	f.Close()
+
+	if _, err := openRepoRegularFile(repoDir, "../../etc/passwd"); err == nil {
+		t.Fatal("accepted a traversal path")
+	}
+	if err := os.Mkdir(filepath.Join(repoDir, "adir"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openRepoRegularFile(repoDir, "adir"); err == nil {
+		t.Fatal("accepted a non-regular file (directory)")
+	}
+
+	outDir := t.TempDir()
+	outside := filepath.Join(outDir, "secret")
+	if err := os.WriteFile(outside, []byte("S"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(repoDir, "evil")); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	if _, err := openRepoRegularFile(repoDir, "evil"); err == nil {
+		t.Fatal("followed a symlink out of the repo")
+	}
+	// os.Root refuses a symlink whose target is an absolute path even when it
+	// resolves inside the repo; the read helper only opens real files.
+	if err := os.Symlink(filepath.Join(repoDir, "ok.txt"), filepath.Join(repoDir, "inlink")); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	if _, err := openRepoRegularFile(repoDir, "inlink"); err == nil {
+		t.Fatal("followed an absolute-target symlink inside the repo")
+	}
+}
+
+// TestShare_ReadManifestRejectsEscapingSymlink locks ReadManifest against a
+// manifest.json committed as a symlink to a file outside the repo: os.Root
+// refuses to follow it, so the read cannot be redirected outside the share repo.
+func TestShare_ReadManifestRejectsEscapingSymlink(t *testing.T) {
+	repoDir := t.TempDir()
+	outDir := t.TempDir()
+	outside := filepath.Join(outDir, "m.json")
+	body, err := json.MarshalIndent(Manifest{Version: ManifestVersion, CLIName: "{{.Name}}-pp-cli"}, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(outside, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(repoDir, ManifestName)); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	m, err := ReadManifest(repoDir)
+	if err == nil {
+		t.Fatalf("ReadManifest followed a symlink out of the repo: %+v", m)
+	}
+	if err == ErrNoManifest {
+		t.Fatal("escaping manifest symlink reported as ErrNoManifest")
+	}
+}
+
+// TestShare_ImportRejectsSymlinkedManifestTableFile locks the import symlink
+// bypass: a manifest table file committed as a symlink to a file outside the
+// repo must not be followed, so a hostile snapshot cannot read an arbitrary
+// local file into a shared table (CWE-22/CWE-73).
+func TestShare_ImportRejectsSymlinkedManifestTableFile(t *testing.T) {
+	if !isSnapshotTable("sync_state") {
+		t.Skip("sync_state not in snapshot allowlist")
+	}
+	ctx := context.Background()
+	dst := openStore(t)
+	repoDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repoDir, "tables"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	outDir := t.TempDir()
+	secret := filepath.Join(outDir, "secret.jsonl")
+	// Shaped like a valid sync_state row so that, if the symlink were followed,
+	// the row would actually import and be observable below.
+	if err := os.WriteFile(secret, []byte(`{"resource_type":"leak","last_synced_at":"now","total_count":1}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(secret, filepath.Join(repoDir, "tables", "sync_state.jsonl")); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	tables := []TableManifest{
+		{
+			Name:    "sync_state",
+			File:    "tables/sync_state.jsonl",
+			Columns: []string{"resource_type", "last_synced_at", "total_count"},
+			Rows:    1,
+		},
+	}
+	writeShareTestManifest(t, repoDir, tables)
+	if _, err := Import(ctx, dst, Options{RepoPath: repoDir}); err == nil {
+		t.Fatal("Import followed a symlinked manifest table file out of the repo")
+	}
+	var n int
+	if err := dst.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM sync_state WHERE resource_type = ?`, "leak").Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 0 {
+		t.Fatal("symlinked table content leaked into the store")
+	}
+}
+
+// TestShare_ExportRefusesManifestSymlink locks the publish-overwrite hardening:
+// if manifest.json is a symlink (to a file outside the repo), Export refuses to
+// write through it rather than overwriting the target (CWE-22/CWE-73).
+func TestShare_ExportRefusesManifestSymlink(t *testing.T) {
+	skipIfNoGit(t)
+	ctx := context.Background()
+	src := openStore(t)
+	repoDir := filepath.Join(t.TempDir(), "share-repo")
+	opts := Options{RepoPath: repoDir}
+	if err := EnsureRepo(ctx, opts); err != nil {
+		t.Fatalf("ensure repo: %v", err)
+	}
+	outDir := t.TempDir()
+	outside := filepath.Join(outDir, "outside.txt")
+	if err := os.WriteFile(outside, []byte("ORIGINAL"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(repoDir, ManifestName)); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	if _, err := Export(ctx, src, opts); err == nil {
+		t.Fatal("Export wrote the manifest through a symlink")
+	}
+	b, err := os.ReadFile(outside)
+	if err != nil {
+		t.Fatalf("read outside target: %v", err)
+	}
+	if string(b) != "ORIGINAL" {
+		t.Fatalf("Export overwrote the symlink target: %q", b)
+	}
+}
+
+// TestShare_RejectsRefspecLikeBranch locks the --branch validation: a value git
+// would read as a refspec rather than a plain branch — most importantly a
+// leading "+" force-update marker or an embedded ":" — and the other names git
+// check-ref-format rejects are refused before any git invocation.
+func TestShare_RejectsRefspecLikeBranch(t *testing.T) {
+	ctx := context.Background()
+	repoDir := filepath.Join(t.TempDir(), "repo")
+	bad := []string{
+		"+main", "main:evil", "bad branch", "ref~1", "a^b", "q?x", "fo[o",
+		"..", "x..y", "foo/.hidden", "name.lock", "end.", "@", "up@{stream}",
+		"/leading", "trailing/", "double//slash", "back\\slash",
+	}
+	for _, b := range bad {
+		if err := EnsureRepo(ctx, Options{RepoPath: repoDir, Branch: b}); err == nil {
+			t.Fatalf("EnsureRepo accepted invalid branch %q", b)
+		}
+	}
+}
+
+// TestShare_AcceptsValidBranch guards against over-rejection: an ordinary
+// branch name with a slash component is still accepted.
+func TestShare_AcceptsValidBranch(t *testing.T) {
+	skipIfNoGit(t)
+	ctx := context.Background()
+	repoDir := filepath.Join(t.TempDir(), "repo")
+	if err := EnsureRepo(ctx, Options{RepoPath: repoDir, Branch: "feature/new-thing"}); err != nil {
+		t.Fatalf("valid branch rejected: %v", err)
+	}
+}

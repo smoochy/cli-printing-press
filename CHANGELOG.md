@@ -1,5 +1,21 @@
 # Changelog
 
+## [4.33.10](https://github.com/mvanhorn/cli-printing-press/compare/v4.33.9...v4.33.10) (2026-10-23)
+
+
+### Bug Fixes
+
+* **cli:** bump golang.org/x/net safe floor to v0.60.0 ([#5164](https://github.com/mvanhorn/cli-printing-press/issues/5164)) ([56135da](https://github.com/mvanhorn/cli-printing-press/commit/56135daaf0e98a1cdf891716a58323bdd09f2d80))
+* **cli:** honor profile flags, deliver sinks, and MCP argument schemas ([#5165](https://github.com/mvanhorn/cli-printing-press/issues/5165)) ([9600d4c](https://github.com/mvanhorn/cli-printing-press/commit/9600d4cb5145cedb8c961ad87d810b8b9a11002d))
+* **cli:** isolate the sample-output probe from the CLI store ([#5166](https://github.com/mvanhorn/cli-printing-press/issues/5166)) ([e27db0e](https://github.com/mvanhorn/cli-printing-press/commit/e27db0e25277f72a539939810f77d466b46008cd))
+* **cli:** keep API strings from injecting terminal controls or encoded secrets ([#5169](https://github.com/mvanhorn/cli-printing-press/issues/5169)) ([c601087](https://github.com/mvanhorn/cli-printing-press/commit/c6010879b4bee3bcc40a184ab8e1e1e66c0076a3))
+* **cli:** page code-orchestration MCP list reads with resumable cursors ([#5127](https://github.com/mvanhorn/cli-printing-press/issues/5127)) ([aa11117](https://github.com/mvanhorn/cli-printing-press/commit/aa1111739693f52e5b5d05cf4630dbb84ac59e7b))
+* **cli:** report incomplete sync and fix OData paging, reconcile, and fan-out ([#5170](https://github.com/mvanhorn/cli-printing-press/issues/5170)) ([0db0d66](https://github.com/mvanhorn/cli-printing-press/commit/0db0d66e8a73dfa6f4386a88858e355e16f6e1fc))
+* **cli:** route emitted OAuth mint tests through testenv ([#5116](https://github.com/mvanhorn/cli-printing-press/issues/5116)) ([f04d907](https://github.com/mvanhorn/cli-printing-press/commit/f04d907283ab3bc241026a15818f92de0d6d2856)), closes [#5110](https://github.com/mvanhorn/cli-printing-press/issues/5110)
+* **cli:** send multipart endpoints through code-orchestration MCP as multipart ([#5129](https://github.com/mvanhorn/cli-printing-press/issues/5129)) ([6cbf5e4](https://github.com/mvanhorn/cli-printing-press/commit/6cbf5e49f10b1c31adee016f69c0de42ee9db191))
+* **cli:** stamp binary-response dry-run action and drop dead stamped-output helper ([#5128](https://github.com/mvanhorn/cli-printing-press/issues/5128)) ([a7a16c4](https://github.com/mvanhorn/cli-printing-press/commit/a7a16c4f3da7cb09adbfb7a4b924bf5597382236))
+* **skills:** build polish gosec that loads current Go and fail partial scans ([#5130](https://github.com/mvanhorn/cli-printing-press/issues/5130)) ([d36b290](https://github.com/mvanhorn/cli-printing-press/commit/d36b290a6d103ce0d6530c4a932dc4821547f01e))
+
 ## [4.33.9](https://github.com/mvanhorn/cli-printing-press/compare/v4.33.8...v4.33.9) (2026-10-21)
 
 

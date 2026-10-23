@@ -140,7 +140,8 @@ type codeOrchEndpoint struct {
 	BodyIsArray bool
 {{- if hasMultipartRequest .APISpec}}
 	// Multipart marks a multipart/form-data body. FileParams name the body
-	// params sent as file parts; the agent passes a local path for each.
+	// params sent as file parts. Over MCP the agent passes base64-encoded file
+	// content for each (or a path confined to the opt-in upload root).
 	Multipart  bool
 	FileParams []string
 {{- end}}
@@ -336,8 +337,9 @@ func codeOrchEndpointMetadata(ep *codeOrchEndpoint) map[string]any {
 {{- if hasMultipartRequest .APISpec}}
 	if ep.Multipart {
 		out["multipart"] = map[string]any{
-			"file_params": ep.FileParams,
-			"file_value":  "local file path",
+			"file_params":    ep.FileParams,
+			"file_value":     "base64-encoded file content",
+			"filename_param": "optional <param>_filename sets the upload filename (servers may sniff format by extension); defaults to the parameter name",
 		}
 	}
 {{- end}}
@@ -738,7 +740,11 @@ func codeOrchInvoke(ctx context.Context, req mcplib.CallToolRequest, executeTool
 {{- end}}
 {{- if hasMultipartRequest .APISpec}}
 		if ep.Multipart {
-			fields, files := codeOrchMultipartParts(ep, params)
+			fields, files, cleanupUploads, uploadErr := codeOrchMultipartParts(ep, params)
+			if uploadErr != nil {
+				return mcpToolError(uploadErr.Error()), nil
+			}
+			defer cleanupUploads()
 			data, _, err = c.PostMultipartWithHeaders(ctx, path, fields, files, hdrs)
 			break
 		}
@@ -762,7 +768,11 @@ func codeOrchInvoke(ctx context.Context, req mcplib.CallToolRequest, executeTool
 {{- end}}
 {{- if hasMultipartRequest .APISpec}}
 		if ep.Multipart {
-			fields, files := codeOrchMultipartParts(ep, params)
+			fields, files, cleanupUploads, uploadErr := codeOrchMultipartParts(ep, params)
+			if uploadErr != nil {
+				return mcpToolError(uploadErr.Error()), nil
+			}
+			defer cleanupUploads()
 			data, _, err = c.PutMultipartWithHeaders(ctx, path, fields, files, hdrs)
 			break
 		}
@@ -786,7 +796,11 @@ func codeOrchInvoke(ctx context.Context, req mcplib.CallToolRequest, executeTool
 {{- end}}
 {{- if hasMultipartRequest .APISpec}}
 		if ep.Multipart {
-			fields, files := codeOrchMultipartParts(ep, params)
+			fields, files, cleanupUploads, uploadErr := codeOrchMultipartParts(ep, params)
+			if uploadErr != nil {
+				return mcpToolError(uploadErr.Error()), nil
+			}
+			defer cleanupUploads()
 			data, _, err = c.PatchMultipartWithHeaders(ctx, path, fields, files, hdrs)
 			break
 		}
@@ -821,25 +835,58 @@ func codeOrchInvoke(ctx context.Context, req mcplib.CallToolRequest, executeTool
 }
 
 {{- if hasMultipartRequest .APISpec}}
-// codeOrchMultipartParts splits params into form fields and file parts. A file
-// param carries a local path that the client reads and uploads as that part.
-func codeOrchMultipartParts(ep *codeOrchEndpoint, params map[string]any) (map[string]string, map[string]string) {
+// codeOrchMultipartParts splits params into form fields and file parts. Each
+// file param is resolved through resolveMCPMultipartFile, which stages the
+// caller-supplied content in a process-owned temp file (base64 content by
+// default; opt-in confined path mode) so an MCP caller cannot make the server
+// read an arbitrary local file.
+func codeOrchMultipartParts(ep *codeOrchEndpoint, params map[string]any) (map[string]string, map[string]string, func(), error) {
 	fields, files := map[string]string{}, map[string]string{}
-	for k, v := range params {
-		isFile := false
-		for _, name := range ep.FileParams {
-			if name == k {
-				isFile = true
-				break
+	var cleanups []func()
+	cleanup := func() {
+		for _, c := range cleanups {
+			c()
+		}
+	}
+	fileParam := func(name string) bool {
+		for _, fp := range ep.FileParams {
+			if fp == name {
+				return true
 			}
 		}
-		if isFile {
-			files[k] = fmt.Sprintf("%v", v)
-		} else {
+		return false
+	}
+	// A "<fileparam>_filename" entry is a companion that names the upload; it is
+	// not itself a form field.
+	companion := func(name string) bool {
+		rest, ok := strings.CutSuffix(name, "_filename")
+		return ok && fileParam(rest)
+	}
+	for k, v := range params {
+		switch {
+		case fileParam(k):
+			// File params carry caller-supplied content/paths. Resolve them
+			// through the same confinement as the typed MCP tools so a client
+			// cannot make the server read an arbitrary local file.
+			filenameHint := ""
+			if fv, ok := params[k+"_filename"]; ok {
+				filenameHint = fmt.Sprintf("%v", fv)
+			}
+			staged, c, err := resolveMCPMultipartFile(k, filenameHint, v)
+			if err != nil {
+				cleanup()
+				return nil, nil, nil, err
+			}
+			cleanups = append(cleanups, c)
+			files[k] = staged
+		case companion(k):
+			// Consumed alongside its file param; never sent as a form field.
+			continue
+		default:
 			fields[k] = mcpMultipartFieldValue(v)
 		}
 	}
-	return fields, files
+	return fields, files, cleanup, nil
 }
 
 {{- end}}

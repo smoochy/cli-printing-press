@@ -52,18 +52,19 @@ func TestCodeOrchestrationSendsMultipartUploads(t *testing.T) {
 		"multipart endpoint must mark its binary body param as a file part")
 	require.Regexp(t, `ID:\s+"packages.replace",\s+Method:\s+"PUT",[\s\S]*?FileParams:\s+\[\]string\{"payload"\}`, src,
 		"PUT multipart endpoint must upload its file param")
-	require.Regexp(t, `if ep\.Multipart \{\s+out\["multipart"\] = map\[string\]any\{\s+"file_params":\s*ep\.FileParams,\s+"file_value":\s*"local file path",`, src,
-		"endpoint metadata must name multipart file params and say their values are local paths")
+	require.Regexp(t, `if ep\.Multipart \{\s+out\["multipart"\] = map\[string\]any\{\s+"file_params":\s*ep\.FileParams,\s+"file_value":\s*"base64-encoded file content",`, src,
+		"endpoint metadata must name multipart file params and say their values are base64 content")
+	require.Contains(t, src, `"filename_param":`,
+		"endpoint metadata must advertise the optional <param>_filename companion")
 
 	runtimeTest := `package mcp
 
 import (
 	"context"
+	"encoding/base64"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -71,19 +72,21 @@ import (
 )
 
 func TestCodeOrchestrationSendsMultipartUploadsRuntime(t *testing.T) {
-	var gotMethod, gotPath, gotType, gotFile, gotRenamed, gotField, gotPayload, gotNote string
+	var gotMethod, gotPath, gotType, gotFile, gotRenamed, gotField, gotPayload, gotNote, gotFileName, gotCompanion string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotMethod, gotPath = r.Method, r.URL.Path
 		gotType = r.Header.Get("Content-Type")
-		gotFile, gotRenamed, gotField, gotPayload, gotNote = "", "", "", "", ""
+		gotFile, gotRenamed, gotField, gotPayload, gotNote, gotFileName, gotCompanion = "", "", "", "", "", "", ""
 		if err := r.ParseMultipartForm(1 << 20); err != nil {
 			t.Errorf("parse multipart: %v", err)
 		}
 		gotField = r.FormValue("projectId")
 		gotNote = r.FormValue("note")
-		if f, _, err := r.FormFile("package"); err == nil {
+		gotCompanion = r.FormValue("package_filename")
+		if f, fh, err := r.FormFile("package"); err == nil {
 			b, _ := io.ReadAll(f)
 			gotFile = string(b)
+			gotFileName = fh.Filename
 		}
 		if f, _, err := r.FormFile("file"); err == nil {
 			b, _ := io.ReadAll(f)
@@ -99,14 +102,14 @@ func TestCodeOrchestrationSendsMultipartUploadsRuntime(t *testing.T) {
 	defer server.Close()
 	t.Setenv("CORCHUPLOAD_BASE_URL", server.URL)
 
-	pkg := filepath.Join(t.TempDir(), "p.bin")
-	if err := os.WriteFile(pkg, []byte("PACKAGE-BYTES"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	// Over MCP a file param must carry base64-encoded content, not a local
+	// path: this is the server-side confinement that blocks arbitrary file
+	// reads. The server still receives the decoded bytes.
+	enc := base64.StdEncoding.EncodeToString([]byte("PACKAGE-BYTES"))
 	result, err := handleCodeOrchExecute(context.Background(), mcplib.CallToolRequest{Params: mcplib.CallToolParams{Arguments: map[string]any{
 		"endpoint_id": "packages.import",
 		"confirm":     true,
-		"params":      map[string]any{"package": pkg, "file": pkg, "projectId": "p1"},
+		"params":      map[string]any{"package": enc, "file": enc, "projectId": "p1", "package_filename": "archive.zip"},
 	}}})
 	if err != nil || result == nil || result.IsError {
 		t.Fatalf("upload failed: result=%#v err=%v", result, err)
@@ -117,18 +120,24 @@ func TestCodeOrchestrationSendsMultipartUploadsRuntime(t *testing.T) {
 	if gotFile != "PACKAGE-BYTES" || gotRenamed != "PACKAGE-BYTES" || gotField != "p1" {
 		t.Fatalf("server saw package=%q file=%q projectId=%q", gotFile, gotRenamed, gotField)
 	}
+	if gotFileName != "archive.zip" {
+		t.Fatalf("package upload filename = %q, want archive.zip", gotFileName)
+	}
+	if gotCompanion != "" {
+		t.Fatalf("package_filename leaked as a form field: %q", gotCompanion)
+	}
 
 	importMeta := codeOrchEndpointMetadata(findCodeOrchEndpoint("packages.import"))
 	mp, _ := importMeta["multipart"].(map[string]any)
 	files, _ := mp["file_params"].([]string)
-	if mp["file_value"] != "local file path" || len(files) != 2 || files[0] != "package" || files[1] != "file" {
+	if mp["file_value"] != "base64-encoded file content" || len(files) != 2 || files[0] != "package" || files[1] != "file" {
 		t.Fatalf("import metadata multipart = %#v", importMeta["multipart"])
 	}
 
 	result, err = handleCodeOrchExecute(context.Background(), mcplib.CallToolRequest{Params: mcplib.CallToolParams{Arguments: map[string]any{
 		"endpoint_id": "packages.replace",
 		"confirm":     true,
-		"params":      map[string]any{"payload": pkg, "note": "n1"},
+		"params":      map[string]any{"payload": enc, "note": "n1"},
 	}}})
 	if err != nil || result == nil || result.IsError {
 		t.Fatalf("put upload failed: result=%#v err=%v", result, err)
@@ -142,7 +151,7 @@ func TestCodeOrchestrationSendsMultipartUploadsRuntime(t *testing.T) {
 	replaceMeta := codeOrchEndpointMetadata(findCodeOrchEndpoint("packages.replace"))
 	rp, _ := replaceMeta["multipart"].(map[string]any)
 	replaceFiles, _ := rp["file_params"].([]string)
-	if rp["file_value"] != "local file path" || len(replaceFiles) != 1 || replaceFiles[0] != "payload" {
+	if rp["file_value"] != "base64-encoded file content" || len(replaceFiles) != 1 || replaceFiles[0] != "payload" {
 		t.Fatalf("replace metadata multipart = %#v", replaceMeta["multipart"])
 	}
 }

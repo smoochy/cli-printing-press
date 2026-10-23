@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -100,6 +101,9 @@ type TableManifest struct {
 // When Remote is set, it clones; otherwise it `git init`s in place so a
 // local-only publish workflow works without any upstream.
 func EnsureRepo(ctx context.Context, opts Options) error {
+	if err := opts.validate(); err != nil {
+		return err
+	}
 	if strings.TrimSpace(opts.RepoPath) == "" {
 		return fmt.Errorf("share repo path is empty")
 	}
@@ -110,7 +114,7 @@ func EnsureRepo(ctx context.Context, opts Options) error {
 		if err := os.MkdirAll(filepath.Dir(opts.RepoPath), 0o700); err != nil {
 			return fmt.Errorf("mkdir share parent: %w", err)
 		}
-		if err := runGit(ctx, "", "clone", opts.Remote, opts.RepoPath); err != nil {
+		if err := runGit(ctx, "", "clone", "--", opts.Remote, opts.RepoPath); err != nil {
 			return err
 		}
 		if strings.TrimSpace(opts.Branch) != "" {
@@ -138,6 +142,9 @@ func EnsureRepo(ctx context.Context, opts Options) error {
 // local checkout. A missing remote ref is treated as an empty branch
 // (first publish hasn't happened yet) rather than an error.
 func Pull(ctx context.Context, opts Options) error {
+	if err := opts.validate(); err != nil {
+		return err
+	}
 	if strings.TrimSpace(opts.Remote) == "" {
 		return nil
 	}
@@ -158,7 +165,7 @@ func Pull(ctx context.Context, opts Options) error {
 	if err := runGit(ctx, opts.RepoPath, "checkout", "-B", branch, "origin/"+branch); err != nil {
 		return err
 	}
-	return runGit(ctx, opts.RepoPath, "pull", "--ff-only", "origin", branch)
+	return runGit(ctx, opts.RepoPath, "pull", "--ff-only", "origin", "--", branch)
 }
 
 // Commit stages everything under the repo and commits with the given
@@ -188,21 +195,24 @@ func Commit(ctx context.Context, opts Options, message string) (bool, error) {
 // it auto-rebases against origin and retries once, mirroring discrawl's
 // policy for serialised team publishes.
 func Push(ctx context.Context, opts Options) error {
+	if err := opts.validate(); err != nil {
+		return err
+	}
 	branch := opts.Branch
 	if strings.TrimSpace(branch) == "" {
 		branch = "main"
 	}
-	out, err := gitOutput(ctx, opts.RepoPath, "push", "-u", "origin", branch)
+	out, err := gitOutput(ctx, opts.RepoPath, "push", "-u", "origin", "--", branch)
 	if err == nil {
 		return nil
 	}
 	if !isNonFastForwardPush(out) {
 		return fmt.Errorf("git push -u origin %s: %w\n%s", branch, err, strings.TrimSpace(out))
 	}
-	if pullErr := runGit(ctx, opts.RepoPath, "pull", "--rebase", "--autostash", "origin", branch); pullErr != nil {
+	if pullErr := runGit(ctx, opts.RepoPath, "pull", "--rebase", "--autostash", "origin", "--", branch); pullErr != nil {
 		return fmt.Errorf("rebase before push retry: %w", pullErr)
 	}
-	return runGit(ctx, opts.RepoPath, "push", "-u", "origin", branch)
+	return runGit(ctx, opts.RepoPath, "push", "-u", "origin", "--", branch)
 }
 
 // Export reads each SnapshotTable from the store and writes per-table
@@ -241,10 +251,54 @@ func Export(ctx context.Context, s *store.Store, opts Options) (Manifest, error)
 		return Manifest{}, err
 	}
 	body = append(body, '\n')
-	if err := os.WriteFile(filepath.Join(opts.RepoPath, ManifestName), body, 0o600); err != nil {
-		return Manifest{}, fmt.Errorf("write manifest: %w", err)
+	if err := writeManifestFile(opts.RepoPath, body); err != nil {
+		return Manifest{}, err
 	}
 	return manifest, nil
+}
+
+// writeManifestFile writes manifest.json inside repoPath via os.Root, which
+// refuses a name that escapes the repo. It also refuses to write through a
+// symlink planted at manifest.json (Lstat catches every symlink, including a
+// relative in-repo one os.Root would otherwise follow), so a hostile repo
+// cannot make publish overwrite a file outside the share repo
+// (CWE-22/CWE-73). The write is staged to a temp name and renamed into place
+// so the final name is never opened through a symlink.
+func writeManifestFile(repoPath string, body []byte) error {
+	r, err := os.OpenRoot(repoPath)
+	if err != nil {
+		return fmt.Errorf("open share repo: %w", err)
+	}
+	defer r.Close()
+	if info, lerr := r.Lstat(ManifestName); lerr == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing to write manifest through symlink %q", ManifestName)
+		}
+	} else if !os.IsNotExist(lerr) {
+		return fmt.Errorf("stat manifest: %w", lerr)
+	}
+	tmp := ManifestName + ".tmp"
+	// Remove any stale or planted temp first (Remove deletes a symlink itself,
+	// not its target), then create exclusively so the open never follows a link.
+	_ = r.Remove(tmp)
+	wf, err := r.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return fmt.Errorf("create manifest temp: %w", err)
+	}
+	if _, err := wf.Write(body); err != nil {
+		wf.Close()
+		_ = r.Remove(tmp)
+		return fmt.Errorf("write manifest: %w", err)
+	}
+	if err := wf.Close(); err != nil {
+		_ = r.Remove(tmp)
+		return fmt.Errorf("write manifest: %w", err)
+	}
+	if err := r.Rename(tmp, ManifestName); err != nil {
+		_ = r.Remove(tmp)
+		return fmt.Errorf("write manifest: %w", err)
+	}
+	return nil
 }
 
 // Import reads the manifest and re-hydrates the local store. It runs
@@ -289,6 +343,9 @@ func Import(ctx context.Context, s *store.Store, opts Options) (Manifest, error)
 		}
 	}
 	for _, table := range manifest.Tables {
+		if !isSnapshotTable(table.Name) {
+			return Manifest{}, fmt.Errorf("refusing manifest table %q: not in the snapshot allowlist", table.Name)
+		}
 		if err := importTable(ctx, tx, opts.RepoPath, table); err != nil {
 			return Manifest{}, err
 		}
@@ -366,11 +423,16 @@ func MarkImported(ctx context.Context, s *store.Store, manifest Manifest) error 
 // ErrNoManifest when the file does not exist (subscriber on a fresh repo
 // that hasn't been published to yet).
 func ReadManifest(repoPath string) (Manifest, error) {
-	data, err := os.ReadFile(filepath.Join(repoPath, ManifestName))
+	f, err := openRepoRegularFile(repoPath, ManifestName)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return Manifest{}, ErrNoManifest
 		}
+		return Manifest{}, fmt.Errorf("read share manifest: %w", err)
+	}
+	data, err := io.ReadAll(f)
+	f.Close()
+	if err != nil {
 		return Manifest{}, fmt.Errorf("read share manifest: %w", err)
 	}
 	var manifest Manifest
@@ -490,6 +552,34 @@ func exportTable(ctx context.Context, db *sql.DB, dataDir, table string) (TableM
 // tolerates a snapshot that includes new columns the subscriber doesn't
 // have — SQLite's tolerant SQL rejects unknown columns at prepare time,
 // surfacing a clear error.
+// openRepoRegularFile opens name within repoPath using os.Root, which refuses a
+// name that escapes the repo via "..", an absolute path, or a symlink pointing
+// outside the repo. It rejects a non-regular file (directory, FIFO, device, or a
+// symlink whose target is not a regular file) so a hostile manifest cannot point
+// a read at something unexpected. The returned file is the caller's to close;
+// closing the root does not close it.
+func openRepoRegularFile(repoPath, name string) (*os.File, error) {
+	r, err := os.OpenRoot(repoPath)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+	f, err := r.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		f.Close()
+		return nil, fmt.Errorf("refusing non-regular file %q", name)
+	}
+	return f, nil
+}
+
 func importTable(ctx context.Context, tx *sql.Tx, repoPath string, entry TableManifest) error {
 	files := entry.Files
 	if entry.File != "" {
@@ -497,6 +587,16 @@ func importTable(ctx context.Context, tx *sql.Tx, repoPath string, entry TableMa
 	}
 	if len(files) == 0 {
 		return nil
+	}
+	// Manifest file paths come from a remote snapshot. Refuse anything that is
+	// not a repo-relative path before touching the database as a fast, clear
+	// rejection; the actual read also goes through os.Root (openRepoRegularFile)
+	// so a traversal or symlink that slips past this string check still cannot
+	// read outside the share repo (CWE-22/CWE-73).
+	for _, relPath := range files {
+		if !filepath.IsLocal(relPath) {
+			return fmt.Errorf("refusing manifest table file %q: path must be local to the share repo", relPath)
+		}
 	}
 	cols := entry.Columns
 	if len(cols) == 0 {
@@ -522,8 +622,9 @@ func importTable(ctx context.Context, tx *sql.Tx, repoPath string, entry TableMa
 	defer stmt.Close()
 
 	for _, relPath := range files {
-		path := filepath.Join(repoPath, relPath)
-		f, err := os.Open(path)
+		// Open through os.Root so a manifest file committed as a symlink to an
+		// outside path cannot be followed, and reject a non-regular file.
+		f, err := openRepoRegularFile(repoPath, relPath)
 		if err != nil {
 			return fmt.Errorf("open %s: %w", relPath, err)
 		}
@@ -690,6 +791,95 @@ func setSyncState(ctx context.Context, s *store.Store, scope, value string) erro
 		return fmt.Errorf("write sync_state %q: %w", scope, err)
 	}
 	return nil
+}
+
+// gitValueLooksLikeOption reports whether a user-supplied git value would be
+// parsed by git as an option rather than a URL, path, or ref. Such values are
+// the vector for git argument injection (for example --upload-pack=<cmd> or
+// --config=core.sshCommand=<cmd>), so they are refused.
+func gitValueLooksLikeOption(v string) bool {
+	return strings.HasPrefix(strings.TrimSpace(v), "-")
+}
+
+// validate rejects remote/branch/repo values that git would treat as options.
+// Together with the "--" end-of-options separators on each git invocation this
+// blocks git argument injection through the share flags (CWE-88).
+func (o Options) validate() error {
+	for _, f := range []struct{ name, val string }{
+		{"--remote", o.Remote},
+		{"--branch", o.Branch},
+		{"--repo", o.RepoPath},
+	} {
+		if gitValueLooksLikeOption(f.val) {
+			return fmt.Errorf("refusing %s %q: values starting with '-' are not allowed", f.name, f.val)
+		}
+	}
+	if err := validateGitBranchName(o.Branch); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateGitBranchName enforces git check-ref-format --branch semantics on a
+// caller-supplied branch. The branch is handed to git after a "--" separator in
+// refspec position (for example `pull --ff-only origin -- <branch>`), so option
+// injection is already blocked; this additionally refuses a value that would be
+// read as a refspec rather than a plain branch name — most importantly a leading
+// "+" force-update marker or an embedded ":" (src:dst) — plus the other names
+// git check-ref-format rejects. An empty branch is allowed (it defaults to main
+// downstream).
+func validateGitBranchName(branch string) error {
+	b := strings.TrimSpace(branch)
+	if b == "" {
+		return nil
+	}
+	if strings.HasPrefix(b, "+") {
+		return fmt.Errorf("refusing --branch %q: a leading '+' is a force-update refspec marker, not a branch name", branch)
+	}
+	if b == "@" {
+		return fmt.Errorf("refusing --branch %q: '@' is not a valid branch name", branch)
+	}
+	if strings.HasPrefix(b, "/") || strings.HasSuffix(b, "/") || strings.Contains(b, "//") {
+		return fmt.Errorf("refusing --branch %q: a branch name must not begin or end with '/' or contain '//'", branch)
+	}
+	if strings.Contains(b, "..") || strings.HasSuffix(b, ".") {
+		return fmt.Errorf("refusing --branch %q: invalid use of '.'", branch)
+	}
+	if strings.Contains(b, "@{") {
+		return fmt.Errorf("refusing --branch %q: '@{' is not allowed in a branch name", branch)
+	}
+	for _, r := range b {
+		switch {
+		case r < 0x20 || r == 0x7f:
+			return fmt.Errorf("refusing --branch %q: control characters are not allowed", branch)
+		case r == ' ' || r == '~' || r == '^' || r == ':' || r == '?' || r == '*' || r == '[' || r == '\\':
+			return fmt.Errorf("refusing --branch %q: character %q is not allowed in a branch name", branch, string(r))
+		}
+	}
+	for _, part := range strings.Split(b, "/") {
+		if part == "" {
+			return fmt.Errorf("refusing --branch %q: empty path component", branch)
+		}
+		if strings.HasPrefix(part, ".") {
+			return fmt.Errorf("refusing --branch %q: a path component must not start with '.'", branch)
+		}
+		if strings.HasSuffix(part, ".lock") {
+			return fmt.Errorf("refusing --branch %q: a path component must not end with '.lock'", branch)
+		}
+	}
+	return nil
+}
+
+// isSnapshotTable reports whether name is in the generator-defined snapshot
+// allowlist. Import only truncates and re-hydrates these tables, so a manifest
+// that names any other table is refused rather than inserted into.
+func isSnapshotTable(name string) bool {
+	for _, t := range SnapshotTables {
+		if t == name {
+			return true
+		}
+	}
+	return false
 }
 
 // runGit invokes git with args in workDir. Stderr is captured and

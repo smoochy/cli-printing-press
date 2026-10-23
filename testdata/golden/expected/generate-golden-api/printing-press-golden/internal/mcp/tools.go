@@ -10,8 +10,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -45,6 +48,7 @@ func RegisterTools(s *server.MCPServer) {
 		mcplib.NewTool("currencies_list",
 			mcplib.WithDescription("List supported currencies. Required: X-Api-Version (default: 2026-04-01). Returns array of Currency."),
 			mcplib.WithString("X-Api-Version", mcplib.Required(), mcplib.Description("Required API version header.")),
+			mcplib.WithSchemaAdditionalProperties(false),
 			mcplib.WithReadOnlyHintAnnotation(true),
 			mcplib.WithDestructiveHintAnnotation(false),
 			mcplib.WithOpenWorldHintAnnotation(true),
@@ -59,6 +63,7 @@ func RegisterTools(s *server.MCPServer) {
 			mcplib.WithString("name", mcplib.Required(), mcplib.Description("Name")),
 			mcplib.WithString("owner_email", mcplib.Description("Owner email")),
 			mcplib.WithString("visibility", mcplib.Required(), mcplib.Description("Visibility")),
+			mcplib.WithSchemaAdditionalProperties(false),
 			mcplib.WithDestructiveHintAnnotation(false),
 			mcplib.WithOpenWorldHintAnnotation(true),
 		),
@@ -69,6 +74,7 @@ func RegisterTools(s *server.MCPServer) {
 			mcplib.WithDescription("Get project. Required: X-Api-Version (default: 2026-04-01), projectId."),
 			mcplib.WithString("X-Api-Version", mcplib.Required(), mcplib.Description("Required API version header.")),
 			mcplib.WithString("projectId", mcplib.Required(), mcplib.Description("Project id")),
+			mcplib.WithSchemaAdditionalProperties(false),
 			mcplib.WithReadOnlyHintAnnotation(true),
 			mcplib.WithDestructiveHintAnnotation(false),
 			mcplib.WithOpenWorldHintAnnotation(true),
@@ -82,6 +88,7 @@ func RegisterTools(s *server.MCPServer) {
 			mcplib.WithString("status", mcplib.Description("Status")),
 			mcplib.WithNumber("limit", mcplib.Description("Limit (default: 25)")),
 			mcplib.WithString("cursor", mcplib.Description("Opaque pagination cursor returned by a previous MCP response")),
+			mcplib.WithSchemaAdditionalProperties(false),
 			mcplib.WithReadOnlyHintAnnotation(true),
 			mcplib.WithDestructiveHintAnnotation(false),
 			mcplib.WithOpenWorldHintAnnotation(true),
@@ -95,7 +102,9 @@ func RegisterTools(s *server.MCPServer) {
 			mcplib.WithString("projectId", mcplib.Required(), mcplib.Description("Project id")),
 			mcplib.WithBoolean("overwrite", mcplib.Description("Overwrite")),
 			mcplib.WithString("caption", mcplib.Description("Caption")),
-			mcplib.WithString("file", mcplib.Description("File")),
+			mcplib.WithString("file", mcplib.Description("File. base64-encoded file content (a filesystem path is accepted only when PRINTING_PRESS_GOLDEN_MCP_UPLOAD_ROOT is set)")),
+			mcplib.WithString("file_filename", mcplib.Description("Optional filename for this upload (for example photo.png); servers may sniff the format from the extension. Sanitized to a base name; path separators and control characters are rejected. Defaults to the parameter name.")),
+			mcplib.WithSchemaAdditionalProperties(false),
 			mcplib.WithOpenWorldHintAnnotation(true),
 		),
 		makeAPIHandler("PUT", "/projects/{projectId}/avatar", false, false, nil, mcpPageConfig{}, []mcpParamBinding{{PublicName: "X-Api-Version", WireName: "X-Api-Version", Location: "header", RequestContentType: "multipart/form-data", Default: "2026-04-01"}, {PublicName: "projectId", WireName: "projectId", Location: "path", RequestContentType: "multipart/form-data"}, {PublicName: "overwrite", WireName: "overwrite", Location: "query", RequestContentType: "multipart/form-data"}, {PublicName: "caption", WireName: "caption", Location: "body", RequestContentType: "multipart/form-data"}, {PublicName: "file", WireName: "file", Location: "body", Format: "binary", RequestContentType: "multipart/form-data"}}, []string{"projectId"}),
@@ -108,6 +117,7 @@ func RegisterTools(s *server.MCPServer) {
 			mcplib.WithString("priority", mcplib.Description("Priority")),
 			mcplib.WithNumber("limit", mcplib.Description("Limit (default: 50)")),
 			mcplib.WithString("cursor", mcplib.Description("Opaque pagination cursor returned by a previous MCP response")),
+			mcplib.WithSchemaAdditionalProperties(false),
 			mcplib.WithReadOnlyHintAnnotation(true),
 			mcplib.WithDestructiveHintAnnotation(false),
 			mcplib.WithOpenWorldHintAnnotation(true),
@@ -124,6 +134,7 @@ func RegisterTools(s *server.MCPServer) {
 			mcplib.WithBoolean("completed", mcplib.Description("Completed")),
 			mcplib.WithString("priority", mcplib.Description("Priority")),
 			mcplib.WithString("title", mcplib.Description("Title")),
+			mcplib.WithSchemaAdditionalProperties(false),
 			mcplib.WithOpenWorldHintAnnotation(true),
 		),
 		makeAPIHandler("PATCH", "/projects/{projectId}/tasks/{taskId}", false, false, nil, mcpPageConfig{}, []mcpParamBinding{{PublicName: "X-Api-Version", WireName: "X-Api-Version", Location: "header", Default: "2026-04-01"}, {PublicName: "projectId", WireName: "projectId", Location: "path"}, {PublicName: "taskId", WireName: "taskId", Location: "path"}, {PublicName: "notify", WireName: "notify", Location: "query"}, {PublicName: "completed", WireName: "completed", Location: "body"}, {PublicName: "priority", WireName: "priority", Location: "body"}, {PublicName: "title", WireName: "title", Location: "body"}}, []string{"projectId", "taskId"}),
@@ -131,6 +142,7 @@ func RegisterTools(s *server.MCPServer) {
 	s.AddTool(
 		mcplib.NewTool("public_get-status",
 			mcplib.WithDescription("Get public service status. (public)"),
+			mcplib.WithSchemaAdditionalProperties(false),
 			mcplib.WithReadOnlyHintAnnotation(true),
 			mcplib.WithDestructiveHintAnnotation(false),
 			mcplib.WithOpenWorldHintAnnotation(true),
@@ -142,6 +154,7 @@ func RegisterTools(s *server.MCPServer) {
 			mcplib.WithDescription("Download the annual report as a binary file. Required: X-Api-Version (default: 2026-04-01), year."),
 			mcplib.WithString("X-Api-Version", mcplib.Required(), mcplib.Description("Required API version header.")),
 			mcplib.WithNumber("year", mcplib.Required(), mcplib.Description("Year")),
+			mcplib.WithSchemaAdditionalProperties(false),
 			mcplib.WithReadOnlyHintAnnotation(true),
 			mcplib.WithDestructiveHintAnnotation(false),
 			mcplib.WithOpenWorldHintAnnotation(true),
@@ -153,6 +166,7 @@ func RegisterTools(s *server.MCPServer) {
 			mcplib.WithDescription("Get a report summary for a year. Required: X-Api-Version (default: 2026-04-01), year."),
 			mcplib.WithString("X-Api-Version", mcplib.Required(), mcplib.Description("Required API version header.")),
 			mcplib.WithNumber("year", mcplib.Required(), mcplib.Description("Year")),
+			mcplib.WithSchemaAdditionalProperties(false),
 			mcplib.WithReadOnlyHintAnnotation(true),
 			mcplib.WithDestructiveHintAnnotation(false),
 			mcplib.WithOpenWorldHintAnnotation(true),
@@ -165,6 +179,7 @@ func RegisterTools(s *server.MCPServer) {
 			mcplib.WithString("X-Api-Version", mcplib.Required(), mcplib.Description("Required API version header.")),
 			mcplib.WithNumber("MaxRecords", mcplib.Description("Max records (default: 500)")),
 			mcplib.WithArray("filter", mcplib.Required(), mcplib.Description("Filter")),
+			mcplib.WithSchemaAdditionalProperties(false),
 			mcplib.WithReadOnlyHintAnnotation(true),
 			mcplib.WithDestructiveHintAnnotation(false),
 			mcplib.WithOpenWorldHintAnnotation(true),
@@ -277,6 +292,182 @@ func mcpMultipartFieldValue(v any) string {
 	return fmt.Sprintf("%v", v)
 }
 
+// mcpUploadRootEnvVar, when set to a directory, lets an operator opt into
+// path-based multipart uploads confined to that directory. When it is unset
+// (the default), a binary multipart parameter supplied over MCP must be
+// base64-encoded file content: an MCP caller cannot name an arbitrary local
+// path for the server to read and exfiltrate.
+const mcpUploadRootEnvVar = "PRINTING_PRESS_GOLDEN_MCP_UPLOAD_ROOT"
+
+// mcpMaxUploadBytes caps the decoded size of a single MCP multipart upload.
+// It bounds the memory an MCP caller can make the server allocate for one file
+// param and the size of a file read out of the opt-in upload root. There is no
+// env override; raise this constant if a legitimate workload needs larger
+// uploads.
+const mcpMaxUploadBytes = 100 << 20 // 100 MiB
+
+// resolveMCPMultipartFile converts an MCP-supplied binary multipart value into
+// a local temp file that this process owns, returning its path plus a cleanup
+// func the caller must defer. In the default (base64) mode the value is decoded
+// as file content. In the opt-in path mode (mcpUploadRootEnvVar set) the value
+// is resolved inside that root via os.Root, which refuses path traversal and any
+// symlink that escapes the root, and a non-regular file is refused. This keeps
+// an MCP client from making the server open an arbitrary local file (CWE-22,
+// CWE-73). The plain-CLI --flag <path> behavior for human operators is
+// unaffected; this path is MCP-only.
+//
+// filenameHint, when set, supplies the multipart filename vendors sniff by
+// extension. It is sanitized to a base name (path separators, control chars,
+// "", ".", and ".." are rejected) and falls back to the parameter name. In the
+// opt-in path mode the filename is derived from the confined path's base name
+// and filenameHint is ignored.
+func resolveMCPMultipartFile(field, filenameHint string, v any) (string, func(), error) {
+	raw, ok := v.(string)
+	if !ok {
+		return "", nil, fmt.Errorf("multipart file parameter %q must be a string over MCP (base64-encoded file content, or a path when %s is set)", field, mcpUploadRootEnvVar)
+	}
+	root := strings.TrimSpace(cliutil.EnvOverride(mcpUploadRootEnvVar))
+	if root == "" {
+		trimmed := strings.TrimSpace(raw)
+		// Reject an over-cap payload before decoding so a hostile caller cannot
+		// force the server to allocate the decoded bytes just to reject them.
+		// EncodedLen(max) is the ceiling of base64 characters for max decoded
+		// bytes; the slack covers newlines and padding in a wrapped payload.
+		if len(trimmed) > base64.StdEncoding.EncodedLen(mcpMaxUploadBytes)+4096 {
+			return "", nil, fmt.Errorf("multipart file parameter %q base64 payload is too large (exceeds the %d-byte decoded MCP upload limit)", field, mcpMaxUploadBytes)
+		}
+		data, err := base64.StdEncoding.DecodeString(trimmed)
+		if err != nil {
+			return "", nil, fmt.Errorf("multipart file parameter %q must be base64-encoded file content over MCP (a filesystem path is not accepted unless %s is set to a directory to allow confined path uploads): %w", field, mcpUploadRootEnvVar, err)
+		}
+		if len(data) > mcpMaxUploadBytes {
+			return "", nil, fmt.Errorf("multipart file parameter %q is %d bytes, which exceeds the %d-byte MCP upload limit", field, len(data), mcpMaxUploadBytes)
+		}
+		return writeMCPUploadTemp(mcpUploadFileName(field, filenameHint), data)
+	}
+	return resolveMCPUploadFromRoot(field, root, raw)
+}
+
+// resolveMCPUploadFromRoot reads a path-mode multipart upload confined to the
+// opt-in upload root. os.Root refuses any name that escapes the root (including
+// an escaping symlink). The file is opened once; a non-regular file (directory,
+// FIFO, device, or a symlink whose target is not a regular file) is refused so a
+// read cannot hang or pull in something unexpected, and io.LimitReader bounds
+// the bytes even if the file grows or its reported size lies.
+func resolveMCPUploadFromRoot(field, root, raw string) (string, func(), error) {
+	r, err := os.OpenRoot(root)
+	if err != nil {
+		return "", nil, fmt.Errorf("open upload root for multipart file parameter %q: %w", field, err)
+	}
+	defer r.Close()
+	rel := raw
+	// Accept an absolute path that still lives inside the root by making it
+	// root-relative; os.Root rejects an absolute name outright.
+	if filepath.IsAbs(raw) {
+		rr, rerr := filepath.Rel(root, raw)
+		if rerr != nil {
+			return "", nil, fmt.Errorf("multipart file parameter %q (%q) is not inside the upload root: %w", field, raw, rerr)
+		}
+		rel = rr
+	}
+	rel = filepath.ToSlash(rel)
+	f, err := r.Open(rel)
+	if err != nil {
+		return "", nil, fmt.Errorf("open multipart file parameter %q (%q) under upload root: %w", field, raw, err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return "", nil, fmt.Errorf("stat multipart file parameter %q (%q) under upload root: %w", field, raw, err)
+	}
+	if !info.Mode().IsRegular() {
+		return "", nil, fmt.Errorf("multipart file parameter %q (%q) is not a regular file; only regular files may be uploaded", field, raw)
+	}
+	if info.Size() > mcpMaxUploadBytes {
+		return "", nil, fmt.Errorf("multipart file parameter %q (%q) is %d bytes, which exceeds the %d-byte MCP upload limit", field, raw, info.Size(), mcpMaxUploadBytes)
+	}
+	data, err := io.ReadAll(io.LimitReader(f, mcpMaxUploadBytes+1))
+	if err != nil {
+		return "", nil, fmt.Errorf("read multipart file parameter %q (%q) under upload root: %w", field, raw, err)
+	}
+	if len(data) > mcpMaxUploadBytes {
+		return "", nil, fmt.Errorf("multipart file parameter %q (%q) exceeds the %d-byte MCP upload limit", field, raw, mcpMaxUploadBytes)
+	}
+	return writeMCPUploadTemp(mcpUploadFileName(field, filepath.Base(filepath.FromSlash(rel))), data)
+}
+
+// writeMCPUploadTemp stages upload bytes in a private temp dir under a sanitized
+// filename, returning the staged path plus a cleanup that removes the dir.
+func writeMCPUploadTemp(name string, data []byte) (string, func(), error) {
+	dir, err := os.MkdirTemp("", "printing-press-golden-pp-mcp-upload-")
+	if err != nil {
+		return "", nil, fmt.Errorf("stage multipart upload %q: %w", name, err)
+	}
+	cleanup := func() { _ = os.RemoveAll(dir) }
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		cleanup()
+		return "", nil, fmt.Errorf("stage multipart upload %q: %w", name, err)
+	}
+	return path, cleanup, nil
+}
+
+// mcpUploadFileName picks a safe multipart filename: the sanitized caller hint
+// when usable, otherwise the sanitized parameter name, otherwise "upload".
+func mcpUploadFileName(field, hint string) string {
+	if name, ok := sanitizeMCPUploadName(hint); ok {
+		return name
+	}
+	if name, ok := sanitizeMCPUploadName(field); ok {
+		return name
+	}
+	return "upload"
+}
+
+// mcpMaxUploadFilenameLen bounds a caller-supplied multipart filename hint. A
+// longer hint falls back to the parameter name rather than erroring.
+const mcpMaxUploadFilenameLen = 255
+
+// sanitizeMCPUploadName reduces a candidate to a safe base filename. It reports
+// false (so the caller falls back) for an empty or over-long name, ".", "..", a
+// name containing a path separator, drive/stream separator ':', control
+// characters, Unicode line/paragraph separators or bidi controls, or a name
+// filepath.IsLocal rejects, so a caller cannot smuggle a directory component,
+// terminal controls, or a deceptive bidi-reordered name into the filename.
+func sanitizeMCPUploadName(candidate string) (string, bool) {
+	candidate = strings.TrimSpace(candidate)
+	if candidate == "" || len(candidate) > mcpMaxUploadFilenameLen {
+		return "", false
+	}
+	for _, r := range candidate {
+		switch {
+		case r < 0x20 || r == 0x7f: // C0 controls and DEL
+			return "", false
+		case r >= 0x80 && r <= 0x9f: // C1 controls
+			return "", false
+		case r == '\u2028' || r == '\u2029': // line and paragraph separators
+			return "", false
+		case r == '\u200e' || r == '\u200f': // LRM / RLM
+			return "", false
+		case r >= '\u202a' && r <= '\u202e': // bidi embeddings and overrides
+			return "", false
+		case r >= '\u2066' && r <= '\u2069': // bidi isolates
+			return "", false
+		}
+	}
+	if strings.ContainsRune(candidate, '/') || strings.ContainsRune(candidate, '\\') || strings.ContainsRune(candidate, ':') {
+		return "", false
+	}
+	base := filepath.Base(filepath.FromSlash(candidate))
+	if base == "" || base == "." || base == ".." || base == string(filepath.Separator) {
+		return "", false
+	}
+	if !filepath.IsLocal(base) {
+		return "", false
+	}
+	return base, true
+}
+
 // makeAPIHandler creates a generic MCP tool handler for an API endpoint.
 func makeAPIHandler(method, pathTemplate string, readOnly bool, binaryResponse bool, headerOverrides map[string]string, pageConfig mcpPageConfig, bindings []mcpParamBinding, positionalParams []string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
@@ -353,6 +544,11 @@ func makeAPIHandler(method, pathTemplate string, readOnly bool, binaryResponse b
 			if strings.EqualFold(binding.RequestContentType, "multipart/form-data") {
 				multipart = true
 			}
+			if strings.EqualFold(binding.Format, "binary") {
+				// The optional companion filename arg is declared in the tool
+				// schema; register it so rejectUndeclaredMCPArgs accepts it.
+				knownArgs[binding.PublicName+"_filename"] = true
+			}
 			v, ok := args[binding.PublicName]
 			if !ok {
 				if binding.Default != "" {
@@ -375,7 +571,16 @@ func makeAPIHandler(method, pathTemplate string, readOnly bool, binaryResponse b
 				bodyArgs[binding.WireName] = v
 				if multipart {
 					if strings.EqualFold(binding.Format, "binary") {
-						multipartFileFields[binding.WireName] = fmt.Sprintf("%v", v)
+						filenameHint := ""
+						if fv, ok := args[binding.PublicName+"_filename"]; ok {
+							filenameHint = fmt.Sprintf("%v", fv)
+						}
+						stagedPath, cleanupUpload, uploadErr := resolveMCPMultipartFile(binding.WireName, filenameHint, v)
+						if uploadErr != nil {
+							return mcpToolError(uploadErr.Error()), nil
+						}
+						defer cleanupUpload()
+						multipartFileFields[binding.WireName] = stagedPath
 					} else {
 						multipartFields[binding.WireName] = mcpMultipartFieldValue(v)
 					}
@@ -395,19 +600,8 @@ func makeAPIHandler(method, pathTemplate string, readOnly bool, binaryResponse b
 			}
 		}
 
-		for k, v := range args {
-			if pathParams[k] || knownArgs[k] {
-				continue
-			}
-			switch method {
-			case "POST", "PUT", "PATCH":
-				bodyArgs[k] = v
-				if multipart {
-					multipartFields[k] = mcpMultipartFieldValue(v)
-				}
-			default:
-				params[k] = formatMCPParamValue(v)
-			}
+		if err := rejectUndeclaredMCPArgs(args, knownArgs, pathParams); err != nil {
+			return mcpToolError(err.Error()), nil
 		}
 
 		// The public cursor argument is either an opaque MCP cursor or, on a
@@ -636,6 +830,163 @@ func mcpToolResultTextWithPlatform(method string, data json.RawMessage, readOnly
 // text-result budget just like successful endpoint results.
 func mcpToolError(message string) *mcplib.CallToolResult {
 	return mcplib.NewToolResultError(bound.Text(message))
+}
+
+// Reserved transport arguments are accepted on every endpoint tool. They are
+// not request fields, so an unused one is ignored instead of copied onto the
+// wire. Declared bindings with these names still flow through knownArgs.
+func mcpReservedArg(name string) bool {
+	switch name {
+	case "cursor", "body_json", "body_base64", "content_type":
+		return true
+	default:
+		return false
+	}
+}
+
+func rejectUndeclaredMCPArgs(args map[string]any, knownArgs, pathParams map[string]bool) error {
+	var unknown []string
+	for name := range args {
+		if pathParams[name] || knownArgs[name] || mcpReservedArg(name) {
+			continue
+		}
+		unknown = append(unknown, name)
+	}
+	if len(unknown) == 0 {
+		return nil
+	}
+	sort.Strings(unknown)
+	candidates := mcpArgCandidates(knownArgs, pathParams)
+	parts := make([]string, len(unknown))
+	for i, name := range unknown {
+		parts[i] = formatUnknownMCPArg(name, suggestMCPArg(name, candidates))
+	}
+	return fmt.Errorf("%s", strings.Join(parts, "; "))
+}
+
+func mcpArgCandidates(knownArgs, pathParams map[string]bool) []string {
+	names := make([]string, 0, len(knownArgs)+len(pathParams))
+	seen := make(map[string]struct{}, len(knownArgs)+len(pathParams))
+	for name := range knownArgs {
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	for name := range pathParams {
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func formatUnknownMCPArg(name, suggestion string) string {
+	if suggestion == "" {
+		return fmt.Sprintf("unknown argument %q", name)
+	}
+	return fmt.Sprintf("unknown argument %q (did you mean %q?)", name, suggestion)
+}
+
+func suggestMCPArg(name string, candidates []string) string {
+	folded := mcpArgFold(name)
+	stripped := mcpArgStrip(folded)
+	best := ""
+	bestDist := 0
+	ambiguous := false
+	consider := func(cand string, dist int) {
+		if best == "" || dist < bestDist {
+			best = cand
+			bestDist = dist
+			ambiguous = false
+			return
+		}
+		if dist == bestDist && cand != best {
+			ambiguous = true
+		}
+	}
+	for _, cand := range candidates {
+		if cand == "" || cand == name {
+			continue
+		}
+		cf := mcpArgFold(cand)
+		if cf == folded {
+			consider(cand, 0)
+			continue
+		}
+		if stripped != "" && mcpArgStrip(cf) == stripped {
+			consider(cand, 0)
+			continue
+		}
+		dist := runeLevenshtein(folded, cf)
+		if mcpArgDistanceOK(folded, cf, dist) {
+			consider(cand, dist)
+		}
+	}
+	if ambiguous {
+		return ""
+	}
+	return best
+}
+
+func mcpArgFold(name string) string {
+	return strings.ReplaceAll(strings.ToLower(name), "-", "_")
+}
+
+func mcpArgStrip(folded string) string {
+	return strings.ReplaceAll(folded, "_", "")
+}
+
+func mcpArgDistanceOK(a, b string, dist int) bool {
+	if dist <= 0 {
+		return false
+	}
+	la, lb := len([]rune(a)), len([]rune(b))
+	if la < 3 || lb < 3 {
+		return false
+	}
+	if la >= 5 && lb >= 5 {
+		return dist <= 2
+	}
+	return dist <= 1
+}
+
+func runeLevenshtein(a, b string) int {
+	ar, br := []rune(a), []rune(b)
+	if len(ar) == 0 {
+		return len(br)
+	}
+	if len(br) == 0 {
+		return len(ar)
+	}
+	prev := make([]int, len(br)+1)
+	cur := make([]int, len(br)+1)
+	for j := range prev {
+		prev[j] = j
+	}
+	for i := 1; i <= len(ar); i++ {
+		cur[0] = i
+		for j := 1; j <= len(br); j++ {
+			cost := 1
+			if ar[i-1] == br[j-1] {
+				cost = 0
+			}
+			del, ins, sub := prev[j]+1, cur[j-1]+1, prev[j-1]+cost
+			cur[j] = del
+			if ins < cur[j] {
+				cur[j] = ins
+			}
+			if sub < cur[j] {
+				cur[j] = sub
+			}
+		}
+		prev, cur = cur, prev
+	}
+	return prev[len(br)]
 }
 
 func mcpToolPageResultText(method string, data json.RawMessage, pageConfig mcpPageConfig, cursor string) *mcplib.CallToolResult {

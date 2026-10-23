@@ -45,8 +45,11 @@ import (
 {{- if .MCP.Intents}}
 	"{{modulePath}}/internal/client"
 {{- end}}
-{{- if or .MCP.Intents $anyRecipeFlag}}
+{{- if or .MCP.Intents $anyRecipeFlag .RecipeIntents}}
 	"{{modulePath}}/internal/cli"
+{{- end}}
+{{- if .RecipeIntents}}
+	"{{modulePath}}/internal/cliutil"
 {{- end}}
 {{- if and .MCP.Intents .HasRequiredRoles}}
 	"{{modulePath}}/internal/config"
@@ -84,33 +87,31 @@ func RegisterIntents(s *server.MCPServer) {
 {{- end}}
 {{- range .RecipeIntents}}
 	{
-{{- $needsCommandPath := false}}
-{{- range .Params}}
-{{- if .FlagName}}
-{{- $needsCommandPath = true}}
-{{- end}}
-{{- end}}
-{{- if $needsCommandPath}}
 		recipePath := []string{
 {{- range .Command}}
 			{{printf "%q" .}},
 {{- end}}
 		}
-{{- end}}
-		opts := []mcplib.ToolOption{
-			mcplib.WithDescription({{printf "%q" .Description}}),
-			mcplib.WithOpenWorldHintAnnotation(true),
-		}
+		// A recipe must not re-expose a command the mirror walker would prune
+		// (Cobra-hidden or mcp:hidden) or that the MCP read-only switch would
+		// drop; otherwise a recipe wrapping, say, `share publish --remote` could
+		// surface a hidden, network-writing command over MCP.
+		if recipeTargetExposed(recipePath) {
+			opts := []mcplib.ToolOption{
+				mcplib.WithDescription({{printf "%q" .Description}}),
+				mcplib.WithOpenWorldHintAnnotation(true),
+			}
 {{- range .Params}}
 {{- if .FlagName}}
-		if !recipeDestinationBlocked(recipePath, {{printf "%q" .FlagName}}) {
-			opts = append(opts, mcplib.{{mcpBindingFunc (recipeParamTypeString .Type)}}({{printf "%q" .InputName}}{{if .Required}}, mcplib.Required(){{end}}, mcplib.Description({{printf "%q" .Description}})))
-		}
+			if !recipeDestinationBlocked(recipePath, {{printf "%q" .FlagName}}) {
+				opts = append(opts, mcplib.{{mcpBindingFunc (recipeParamTypeString .Type)}}({{printf "%q" .InputName}}{{if .Required}}, mcplib.Required(){{end}}, mcplib.Description({{printf "%q" .Description}})))
+			}
 {{- else}}
-		opts = append(opts, mcplib.{{mcpBindingFunc (recipeParamTypeString .Type)}}({{printf "%q" .InputName}}{{if .Required}}, mcplib.Required(){{end}}, mcplib.Description({{printf "%q" .Description}})))
+			opts = append(opts, mcplib.{{mcpBindingFunc (recipeParamTypeString .Type)}}({{printf "%q" .InputName}}{{if .Required}}, mcplib.Required(){{end}}, mcplib.Description({{printf "%q" .Description}})))
 {{- end}}
 {{- end}}
-		s.AddTool(mcplib.NewTool({{printf "%q" .Name}}, opts...), handle{{pascal .Name}})
+			s.AddTool(mcplib.NewTool({{printf "%q" .Name}}, opts...), handle{{pascal .Name}})
+		}
 	}
 {{- end}}
 {{- if and .PreserveMCPIntentRegistration (not .PreserveMCPIntentFile)}}
@@ -211,20 +212,19 @@ func handle{{pascal .Name}}(ctx context.Context, req mcplib.CallToolRequest) (*m
 		return mcplib.NewToolResultError(fmt.Sprintf("companion CLI binary not found: %v", recipeCLIPathErr)), nil
 	}
 
-	input := req.GetArguments()
-{{- $needsCommandPath := false}}
-{{- range .Params}}
-{{- if .FlagName}}
-{{- $needsCommandPath = true}}
-{{- end}}
-{{- end}}
-{{- if $needsCommandPath}}
 	recipePath := []string{
 {{- range .Command}}
 		{{printf "%q" .}},
 {{- end}}
 	}
-{{- end}}
+	// Re-check exposure at call time: the read-only switch may have flipped on
+	// since registration, and a handler must never run a hidden or read-only-
+	// blocked command even if its tool was registered earlier.
+	if !recipeTargetExposed(recipePath) {
+		return mcplib.NewToolResultError("tool is not available"), nil
+	}
+
+	input := req.GetArguments()
 	args := []string{
 	}
 	recipeEnd := -1
@@ -436,21 +436,34 @@ func init() {
 	recipeCLIPath, recipeCLIPathErr = cobratree.SiblingCLIPath()
 }
 
-{{- if $anyRecipeFlag}}
-// recipeCommandRoot is the Cobra tree consulted for write-sink and read-path
-// annotations. Recipe text does not carry mcp:write-flags or mcp:read-flags;
-// the live command does.
+// recipeCommandRoot is the live Cobra tree consulted for a recipe's target
+// command: its hidden / mcp:hidden / read-only annotations, and its write-sink
+// and read-path flag annotations. Recipe text does not carry these; the live
+// command does.
 var recipeCommandRoot = cli.RootCmd
 
-func recipeDestinationBlocked(path []string, flagName string) bool {
-	if flagName == "" {
-		return false
-	}
+// recipeTargetExposed reports whether the command a recipe wraps may be surfaced
+// and run over MCP right now. When the recipe's target resolves to an in-tree
+// command, that command must not be hidden (itself or an ancestor, Cobra-hidden
+// or mcp:hidden) — otherwise the recipe would re-expose a surface the mirror
+// walker deliberately pruned. While the MCP read-only switch is on, the recipe
+// is withheld unless its target is provably safe: annotated mcp:read-only or
+// mcp:local-write. A recipe whose target does not resolve to an in-tree command
+// cannot be the hidden command, so it is not blocked on that basis when the
+// read-only switch is off, but it is still withheld under read-only (an
+// unverifiable target cannot be proven side-effect-free).
+func recipeTargetExposed(path []string) bool {
 	if recipeCommandRoot == nil {
-		return cobratree.DestinationFlagBlocked(nil, flagName) || cobratree.InputFlagBlocked(nil, flagName)
+		return true
 	}
 	cmd := cobratree.CommandAtPath(recipeCommandRoot(), recipeCommandPath(path))
-	return cobratree.DestinationFlagBlocked(cmd, flagName) || cobratree.InputFlagBlocked(cmd, flagName)
+	if cmd != nil && !cobratree.CommandExposableOverMCP(cmd) {
+		return false
+	}
+	if cliutil.IsMCPReadOnlyEnv() && !cobratree.CommandAllowedUnderMCPReadOnly(cmd) {
+		return false
+	}
+	return true
 }
 
 // recipeCommandPath keeps the Cobra command words. Static flags such as
@@ -464,6 +477,18 @@ func recipeCommandPath(path []string) []string {
 		out = append(out, token)
 	}
 	return out
+}
+
+{{- if $anyRecipeFlag}}
+func recipeDestinationBlocked(path []string, flagName string) bool {
+	if flagName == "" {
+		return false
+	}
+	if recipeCommandRoot == nil {
+		return cobratree.DestinationFlagBlocked(nil, flagName) || cobratree.InputFlagBlocked(nil, flagName)
+	}
+	cmd := cobratree.CommandAtPath(recipeCommandRoot(), recipeCommandPath(path))
+	return cobratree.DestinationFlagBlocked(cmd, flagName) || cobratree.InputFlagBlocked(cmd, flagName)
 }
 {{- end}}
 

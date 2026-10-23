@@ -495,6 +495,9 @@ func extractMCPRecipeIntentSource(source, modulePath string) ([]byte, error) {
 	if declsContainIdentifier(recipeDecls, "cli") {
 		fmt.Fprintf(&out, "\t%q\n", modulePath+"/internal/cli")
 	}
+	if declsContainIdentifier(recipeDecls, "cliutil") {
+		fmt.Fprintf(&out, "\t%q\n", modulePath+"/internal/cliutil")
+	}
 	fmt.Fprintf(&out, "\t%q\n)\n\nfunc RegisterRecipeIntents(s *server.MCPServer) {\n", modulePath+"/internal/mcp/cobratree")
 	out.Write(registration.Bytes())
 	out.WriteString("}\n\n")

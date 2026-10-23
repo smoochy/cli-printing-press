@@ -29,7 +29,10 @@ One teammate with API credentials runs 'share publish' on a cadence; the
 rest run 'share subscribe <remote>' once, then read from the cache
 without needing credentials. Auto-refresh picks up new snapshots on the
 next read command.`,
-		Annotations: map[string]string{"mcp:read-only": "true", "pp:parent-group": "true", "pp:typed-exit-codes": "0,2"},
+		// share is a local-operator command group: it drives git and the local
+		// cache store, so it is hidden from the MCP surface entirely (parent and
+		// every child) rather than mirrored as a shell-out tool.
+		Annotations: map[string]string{"mcp:hidden": "true", "mcp:read-only": "true", "pp:parent-group": "true", "pp:typed-exit-codes": "0,2"},
 		RunE:        parentNoSubcommandRunE(flags),
 	}
 	cmd.AddCommand(newShareExportCmd(flags))
@@ -43,6 +46,7 @@ func newShareExportCmd(flags *rootFlags) *cobra.Command {
 	var repoPath string
 	cmd := &cobra.Command{
 		Use:   "export",
+		Annotations: map[string]string{"mcp:hidden": "true"},
 		Short: "Write a snapshot of the local cache to a directory",
 		Long: `Export snapshots the configured tables to a local directory in the
 share format (manifest.json + per-table JSONL). The directory is not
@@ -79,6 +83,7 @@ func newShareImportCmd(flags *rootFlags) *cobra.Command {
 	var repoPath string
 	cmd := &cobra.Command{
 		Use:   "import",
+		Annotations: map[string]string{"mcp:hidden": "true"},
 		Short: "Hydrate the local cache from a snapshot directory",
 		Long: `Import reads a manifest + JSONL tables from a local directory and
 replaces the matching cache tables. Useful for offline workflows,
@@ -118,6 +123,7 @@ func newSharePublishCmd(flags *rootFlags) *cobra.Command {
 	var repoPath, remote, branch, message string
 	cmd := &cobra.Command{
 		Use:   "publish",
+		Annotations: map[string]string{"mcp:hidden": "true"},
 		Short: "Export the local cache and push it to a git remote",
 		Long: `Publish is the full team-snapshot workflow: ensure the share repo,
 pull any upstream changes, export the current cache, commit, and push.
@@ -181,6 +187,7 @@ func newShareSubscribeCmd(flags *rootFlags) *cobra.Command {
 	var repoPath, remote, branch string
 	cmd := &cobra.Command{
 		Use:   "subscribe",
+		Annotations: map[string]string{"mcp:hidden": "true"},
 		Short: "Clone a share repo and hydrate the local cache from it",
 		Long: `Subscribe is the credential-free onboarding flow: clone the share repo,
 read the latest manifest, and re-hydrate the local cache. After subscribe,

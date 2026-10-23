@@ -863,6 +863,27 @@ func TestGenerateShareEmittedWhenEnabled(t *testing.T) {
 	assert.Contains(t, string(rootSrc), "rootCmd.AddCommand(newShareCmd(flags))",
 		"root.go must register newShareCmd when share is enabled")
 
+	// Security hardening: the share command tree and every subcommand are
+	// hidden from the MCP surface so an MCP client cannot drive git export or
+	// subscribe to an attacker-chosen remote.
+	shareCmdsStr := string(data)
+	assert.GreaterOrEqual(t, strings.Count(shareCmdsStr, `"mcp:hidden": "true"`), 5,
+		"share parent and all four subcommands must carry mcp:hidden")
+
+	// Security hardening: the share git/path layer must validate option-like
+	// values, pass end-of-options separators to git, and confine manifest
+	// table files and names.
+	shareSrc, err := os.ReadFile(filepath.Join(outputDir, "internal", "share", "share.go"))
+	require.NoError(t, err)
+	for _, snippet := range []string{
+		"func (o Options) validate() error",
+		`"clone", "--", opts.Remote, opts.RepoPath`,
+		"filepath.IsLocal(relPath)",
+		"isSnapshotTable(table.Name)",
+	} {
+		assert.Contains(t, string(shareSrc), snippet, "share.go missing hardening %q", snippet)
+	}
+
 	// The generated share package tests must compile and pass; this is
 	// the round-trip safety net for the Unit 5 contract.
 	runGoCommand(t, outputDir, "mod", "tidy")
