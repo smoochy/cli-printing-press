@@ -335,6 +335,7 @@ func New(s *spec.APISpec, outputDir string) *Generator {
 		"authPlaceholderCredentialSetup":      g.alignedAuthPlaceholderCredentialSetup,
 		"authErrorCheckHint":                  authErrorCheckHint,
 		"authSetupHint":                       g.alignedAuthSetupHint,
+		"envAssignHintCall":                   envAssignHintCall,
 		"authBrowserLoginAvailable":           authBrowserLoginAvailable,
 		"authCodeSetTokenAvailable":           authCodeSetTokenAvailable,
 		"bearerCredShadowsAccessToken":        bearerRequestCredentialShadowsAccessToken,
@@ -432,6 +433,8 @@ func New(s *spec.APISpec, outputDir string) *Generator {
 		},
 		"intentIsReadOnly":                    intentIsReadOnly,
 		"intentIsDestructive":                 intentIsDestructive,
+		"mcpWriteDestructiveHint":             mcpWriteDestructiveHint,
+		"intentDestructiveHint":               intentDestructiveHint,
 		"composeIntentToolDescription":        composeIntentToolDescription,
 		"intentParamsForEmit":                 intentParamsForEmit,
 		"intentParamDefaultGo":                intentParamDefaultGo,
@@ -458,6 +461,8 @@ func New(s *spec.APISpec, outputDir string) *Generator {
 		"bodyHasStringBackedBool":             bodyHasStringBackedBool,
 		"multipartBodyMaps":                   multipartBodyMaps,
 		"endpointUsesMultipart":               endpointUsesMultipart,
+		"endpointHasMCPUpload":                endpointHasMCPUpload,
+		"mcpUploadConfirmArg":                 mcpUploadConfirmArg,
 		"isBinaryParam":                       isBinaryParam,
 		"endpointHasJSONBody":                 endpointHasJSONBody,
 		"endpointReplaySafe":                  endpointReplaySafe,
@@ -2091,47 +2096,57 @@ func authCredentialConsolidationAction(auth spec.AuthConfig) string {
 	}
 }
 
-func authPlaceholderCredentialSetup(auth spec.AuthConfig, cliName string) string {
+func authPlaceholderCredentialSetup(auth spec.AuthConfig, cliName string) hintBuilder {
+	var b hintBuilder
 	switch {
 	case auth.EffectiveOAuth2Grant() == spec.OAuth2GrantClientCredentials && auth.TokenURL != "":
-		return fmt.Sprintf("%s-pp-cli auth login or %s", cliName, authSetTokenStdinCommand(cliName))
+		b.lit(fmt.Sprintf("%s-pp-cli auth login or %s", cliName, authSetTokenStdinCommand(cliName)))
+		return b
 	case auth.EffectiveOAuth2Grant() == spec.OAuth2GrantDeviceCode && auth.DeviceAuthorizationURL != "" && auth.TokenURL != "":
-		return fmt.Sprintf("%s-pp-cli auth login --device-code or %s", cliName, authSetTokenStdinCommand(cliName))
+		b.lit(fmt.Sprintf("%s-pp-cli auth login --device-code or %s", cliName, authSetTokenStdinCommand(cliName)))
+		return b
 	case auth.Type == "oauth2" && !oauth2RegistersAuthLogin(auth) && !authBrowserLoginAvailable(auth):
-		return fmt.Sprintf("%s-pp-cli auth setup", cliName)
+		b.lit(fmt.Sprintf("%s-pp-cli auth setup", cliName))
+		return b
 	case auth.Type == "oauth2" || authBrowserLoginAvailable(auth):
-		return fmt.Sprintf("%s-pp-cli auth login", cliName)
+		b.lit(fmt.Sprintf("%s-pp-cli auth login", cliName))
+		return b
 	case auth.Type == "cookie" || auth.Type == "composed" || auth.Type == "session_handshake":
-		return fmt.Sprintf("%s-pp-cli auth login", cliName)
+		b.lit(fmt.Sprintf("%s-pp-cli auth login", cliName))
+		return b
 	}
 
 	persistenceCommand := authCredentialPersistenceCommand(auth, cliName)
 	if persistenceCommand == "" {
-		if hint := authSetupHint(auth, cliName); hint != "" {
+		if hint := authSetupHint(auth, cliName); hint.prose() != "" {
 			return hint
 		}
-		return fmt.Sprintf("%s-pp-cli auth setup", cliName)
+		b.lit(fmt.Sprintf("%s-pp-cli auth setup", cliName))
+		return b
 	}
-	exports := authCredentialExports(auth)
-	if exports == "" {
-		return persistenceCommand
+	pairs := authCredentialExportPairs(auth)
+	if len(pairs) == 0 {
+		b.lit(persistenceCommand)
+		return b
 	}
-	return exports + " or " + persistenceCommand
+	b.assign(false, pairs...)
+	b.lit(" or " + persistenceCommand)
+	return b
 }
 
-func authCredentialExports(auth spec.AuthConfig) string {
+func authCredentialExportPairs(auth spec.AuthConfig) []string {
 	envVars := requiredRequestAuthEnvVars(auth)
 	if len(envVars) == 0 && auth.IsAuthEnvVarORCase() {
 		envVars = requestAuthEnvVars(auth)
 	}
 	if len(envVars) == 0 {
-		return ""
+		return nil
 	}
-	exports := make([]string, 0, len(envVars))
+	pairs := make([]string, 0, len(envVars)*2)
 	for _, envVar := range envVars {
-		exports = append(exports, fmt.Sprintf("%s=<%s>", envVar.Name, authEnvPlaceholderByName(envVar.Name)))
+		pairs = append(pairs, envVar.Name, "<"+authEnvPlaceholderByName(envVar.Name)+">")
 	}
-	return "export " + strings.Join(exports, " ")
+	return pairs
 }
 
 func authSetTokenAvailableForRequiredCount(auth spec.AuthConfig, requiredCount int) bool {
@@ -2172,66 +2187,190 @@ func authErrorCheckHint(auth spec.AuthConfig) string {
 	}
 }
 
-func authSetupHint(auth spec.AuthConfig, cliName string) string {
+func authSetupHint(auth spec.AuthConfig, cliName string) hintBuilder {
+	var b hintBuilder
 	if auth.Subtype == spec.AuthSubtypeGoogleServiceAccount {
-		return fmt.Sprintf("Run '%s-pp-cli auth service-account --key <service-account.json>' or set GOOGLE_OAUTH_ACCESS_TOKEN.", cliName)
+		b.lit(fmt.Sprintf("Run '%s-pp-cli auth service-account --key <service-account.json>' or set GOOGLE_OAUTH_ACCESS_TOKEN.", cliName))
+		return b
 	}
 	switch auth.Type {
 	case "", "none":
-		return ""
+		return b
 	case "cookie", "composed":
-		return fmt.Sprintf("Run '%s-pp-cli auth login --chrome' to refresh browser-session credentials.", cliName)
+		b.lit(fmt.Sprintf("Run '%s-pp-cli auth login --chrome' to refresh browser-session credentials.", cliName))
+		return b
 	case "oauth2":
 		if oauth2RegistersAuthLogin(auth) {
-			return fmt.Sprintf("Run '%s-pp-cli auth login' to re-authenticate.", cliName)
+			b.lit(fmt.Sprintf("Run '%s-pp-cli auth login' to re-authenticate.", cliName))
+			return b
 		}
-		return fmt.Sprintf("Run '%s-pp-cli auth setup' for credential setup steps.", cliName)
+		b.lit(fmt.Sprintf("Run '%s-pp-cli auth setup' for credential setup steps.", cliName))
+		return b
 	}
 	if authBrowserLoginAvailable(auth) {
-		return fmt.Sprintf("Run '%s-pp-cli auth login' to re-authenticate.", cliName)
+		b.lit(fmt.Sprintf("Run '%s-pp-cli auth login' to re-authenticate.", cliName))
+		return b
 	}
 
 	envVars := requiredRequestAuthEnvVars(auth)
 	if len(envVars) == 0 && auth.IsAuthEnvVarORCase() {
 		envVars = requestAuthEnvVars(auth)
-		exports := make([]string, 0, len(envVars))
-		for _, envVar := range envVars {
-			exports = append(exports, fmt.Sprintf(`export %s="%s"`, envVar.Name, authEnvPlaceholder(envVar)))
-		}
-		if len(exports) > 0 {
-			return "Set one of: " + strings.Join(exports, " or ")
+		if len(envVars) > 0 {
+			b.lit("Set one of: ")
+			for i, envVar := range envVars {
+				if i > 0 {
+					b.lit(" or ")
+				}
+				b.assign(true, envVar.Name, authEnvPlaceholder(envVar))
+			}
+			return b
 		}
 	}
 	if len(envVars) == 0 {
-		return fmt.Sprintf("Run '%s-pp-cli auth setup' for credential setup steps.", cliName)
+		b.lit(fmt.Sprintf("Run '%s-pp-cli auth setup' for credential setup steps.", cliName))
+		return b
 	}
 
-	exports := make([]string, 0, len(envVars))
+	pairs := make([]string, 0, len(envVars)*2)
 	for _, envVar := range envVars {
-		exports = append(exports, fmt.Sprintf(`%s="%s"`, envVar.Name, authEnvPlaceholder(envVar)))
+		pairs = append(pairs, envVar.Name, authEnvPlaceholder(envVar))
 	}
 
 	if len(envVars) == 1 {
 		switch auth.Type {
 		case "bearer_token", "oauth2_refresh":
 			if authSetTokenAvailableForRequiredCount(auth, len(envVars)) {
-				return fmt.Sprintf("Set it with: %s or export %s", authSetTokenStdinCommand(cliName), exports[0])
+				b.lit("Set it with: " + authSetTokenStdinCommand(cliName) + " or ")
+				b.assign(true, pairs...)
+				return b
 			}
-			return fmt.Sprintf("Set it with: export %s", exports[0])
+			b.lit("Set it with: ")
+			b.assign(true, pairs...)
+			return b
 		case "api_key":
 			if strings.Contains(strings.ToLower(auth.Format), "basic ") {
-				return fmt.Sprintf("Set the Basic credential with: export %s", exports[0])
+				b.lit("Set the Basic credential with: ")
+				b.assign(true, pairs...)
+				return b
 			}
-			return fmt.Sprintf("Set your API key with: export %s", exports[0])
+			b.lit("Set your API key with: ")
+			b.assign(true, pairs...)
+			return b
 		default:
-			return fmt.Sprintf("Set credentials with: export %s", exports[0])
+			b.lit("Set credentials with: ")
+			b.assign(true, pairs...)
+			return b
 		}
 	}
 
 	if strings.Contains(strings.ToLower(auth.Format), "basic ") {
-		return "Set Basic credentials with: export " + strings.Join(exports, " ")
+		b.lit("Set Basic credentials with: ")
+	} else {
+		b.lit("Set credentials with: ")
 	}
-	return "Set credentials with: export " + strings.Join(exports, " ")
+	b.assign(true, pairs...)
+	return b
+}
+
+// hintPiece is either literal prose or one cliutil.EnvAssignHint call.
+// POSIX prose is what darwin and linux print; the call evaluates that
+// prose there and a PowerShell assignment on Windows.
+type hintPiece struct {
+	literal string
+	quoted  bool
+	pairs   []string
+}
+
+type hintBuilder struct {
+	parts []hintPiece
+}
+
+func (b *hintBuilder) lit(s string) {
+	if s == "" {
+		return
+	}
+	if n := len(b.parts); n > 0 && len(b.parts[n-1].pairs) == 0 {
+		b.parts[n-1].literal += s
+		return
+	}
+	b.parts = append(b.parts, hintPiece{literal: s})
+}
+
+func (b *hintBuilder) assign(quoted bool, pairs ...string) {
+	if len(pairs) == 0 {
+		return
+	}
+	b.parts = append(b.parts, hintPiece{quoted: quoted, pairs: append([]string(nil), pairs...)})
+}
+
+func (b hintBuilder) hasAssign() bool {
+	for _, part := range b.parts {
+		if len(part.pairs) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (b hintBuilder) prose() string {
+	var buf strings.Builder
+	for _, part := range b.parts {
+		if len(part.pairs) == 0 {
+			buf.WriteString(part.literal)
+			continue
+		}
+		buf.WriteString(posixEnvAssign(part.quoted, part.pairs))
+	}
+	return buf.String()
+}
+
+func (b hintBuilder) expr() string {
+	if len(b.parts) == 0 {
+		return ""
+	}
+	if !b.hasAssign() {
+		return strconv.Quote(b.prose())
+	}
+	exprs := make([]string, 0, len(b.parts))
+	for _, part := range b.parts {
+		if len(part.pairs) == 0 {
+			exprs = append(exprs, strconv.Quote(part.literal))
+			continue
+		}
+		exprs = append(exprs, envAssignHintCall(part.quoted, part.pairs...))
+	}
+	return strings.Join(exprs, " + ")
+}
+
+// posixEnvAssign is the non-Windows text of cliutil.EnvAssignHint.
+// The two must agree: generated tests execute the helper, and this
+// text is what existing POSIX hints print.
+func posixEnvAssign(quoted bool, pairs []string) string {
+	parts := make([]string, 0, len(pairs)/2)
+	for i := 0; i+1 < len(pairs); i += 2 {
+		if quoted {
+			parts = append(parts, pairs[i]+`="`+pairs[i+1]+`"`)
+		} else {
+			parts = append(parts, pairs[i]+`=`+pairs[i+1])
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "export " + strings.Join(parts, " ")
+}
+
+func envAssignHintCall(quoted bool, pairs ...string) string {
+	args := make([]string, 0, 1+len(pairs))
+	if quoted {
+		args = append(args, "true")
+	} else {
+		args = append(args, "false")
+	}
+	for _, pair := range pairs {
+		args = append(args, strconv.Quote(pair))
+	}
+	return "cliutil.EnvAssignHint(" + strings.Join(args, ", ") + ")"
 }
 
 func authBrowserLoginAvailable(auth spec.AuthConfig) bool {
@@ -2362,7 +2501,7 @@ func (g *Generator) authRecoveryCommand() string {
 }
 
 func (g *Generator) alignedAuthSetupHint(auth spec.AuthConfig, cliName string) string {
-	return g.alignAuthCommandHint(authSetupHint(auth, cliName), cliName)
+	return g.alignHintExpr(authSetupHint(auth, cliName), cliName)
 }
 
 func (g *Generator) alignedAuthCredentialConsolidationAction(auth spec.AuthConfig) string {
@@ -2390,7 +2529,22 @@ func (g *Generator) alignedAuthCredentialConsolidationAction(auth spec.AuthConfi
 }
 
 func (g *Generator) alignedAuthPlaceholderCredentialSetup(auth spec.AuthConfig, cliName string) string {
-	return g.alignAuthCommandHint(authPlaceholderCredentialSetup(auth, cliName), cliName)
+	return g.alignHintExpr(authPlaceholderCredentialSetup(auth, cliName), cliName)
+}
+
+// alignHintExpr rewrites command-only sentences, then emits a Go
+// expression. Assignment hints stay calls so the printed CLI can pick
+// the shell at runtime; quoting them here would bake the POSIX form
+// into every OS.
+func (g *Generator) alignHintExpr(h hintBuilder, cliName string) string {
+	prose := h.prose()
+	if prose == "" {
+		return ""
+	}
+	if h.hasAssign() {
+		return h.expr()
+	}
+	return strconv.Quote(g.alignAuthCommandHint(prose, cliName))
 }
 
 // alignAuthCommandHint rewrites a bare auth login or auth setup phrase when
@@ -2543,29 +2697,37 @@ var readOperationIDPrefixes = map[string]bool{
 	"fetch":    true,
 }
 
-// Conservative action tokens for GET-based endpoints. A leading token
-// here opts a GET into the write path even on an ordinary REST path.
-// RPC-over-GET without a read signal fails closed independently of
-// these tokens.
+// Conservative action tokens for GET-based endpoints. A leading token of
+// the operation id, or of an action-shaped last path segment, opts a GET
+// into the write path even on an ordinary REST path. RPC-over-GET without
+// a read signal fails closed independently of these tokens.
 var mutationOperationIDPrefixes = map[string]bool{
 	"activate":   true,
 	"add":        true,
 	"approve":    true,
 	"archive":    true,
+	"assign":     true,
 	"cancel":     true,
+	"clear":      true,
 	"create":     true,
 	"deactivate": true,
 	"delete":     true,
 	"deploy":     true,
 	"disable":    true,
 	"enable":     true,
+	"exec":       true,
 	"execute":    true,
 	"insert":     true,
+	"invoke":     true,
+	"isolate":    true,
 	"pause":      true,
 	"publish":    true,
+	"purge":      true,
 	"put":        true,
+	"reboot":     true,
 	"reject":     true,
 	"remove":     true,
+	"reset":      true,
 	"restart":    true,
 	"restore":    true,
 	"resume":     true,
@@ -2573,6 +2735,7 @@ var mutationOperationIDPrefixes = map[string]bool{
 	"rotate":     true,
 	"run":        true,
 	"save":       true,
+	"scan":       true,
 	"send":       true,
 	"set":        true,
 	"start":      true,
@@ -2582,6 +2745,7 @@ var mutationOperationIDPrefixes = map[string]bool{
 	"unpublish":  true,
 	"update":     true,
 	"upsert":     true,
+	"wipe":       true,
 }
 
 // writeOperationIDFragments name mutations. When a read-shaped leading token
@@ -2654,6 +2818,11 @@ func endpointIsWriteCommandShared(endpoint spec.Endpoint, opName string, sharedG
 		if mutationOperationIDPrefixes[leading] {
 			return true
 		}
+		// A one-word operation name ("list", "get") says nothing about the
+		// action, so an action-shaped path decides.
+		if len(tokens) <= 1 && mutationOperationIDPrefixes[actionPathLeadingToken(endpoint.Path)] {
+			return true
+		}
 		if readOperationIDPrefixes[leading] {
 			return leadingTokenHasWriteFragment(tokens)
 		}
@@ -2663,6 +2832,33 @@ func endpointIsWriteCommandShared(endpoint spec.Endpoint, opName string, sharedG
 		return leadingTokenHasWriteFragment(tokens)
 	}
 	return !bodyIsAllFilterShape(endpoint.Body)
+}
+
+// actionPathLeadingToken returns the lowercased leading token of the last
+// path segment when that segment is shaped like an action name: one bare word
+// ("reboot") or a PascalCase run ("RemoveStandard"). RPC-style APIs name the
+// action in the path while the operation id stays generic ("list"). A trailing
+// path parameter, a lowerCamel run ("sendAs", "restorePoints"), or a multi-word
+// kebab or snake segment ("scan-results") usually names a resource, so those
+// return "".
+func actionPathLeadingToken(path string) string {
+	segments := strings.Split(strings.TrimRight(canonicalRPCPath(path), "/"), "/")
+	segment := strings.TrimSpace(segments[len(segments)-1])
+	if segment == "" || strings.HasPrefix(segment, "{") {
+		return ""
+	}
+	tokens := camelCaseTokens(segment)
+	switch {
+	case len(tokens) == 1:
+		return strings.ToLower(tokens[0])
+	case len(tokens) > 1 && strings.IndexFunc(segment, isPathWordSeparator) < 0 && unicode.IsUpper([]rune(segment)[0]):
+		return strings.ToLower(tokens[0])
+	}
+	return ""
+}
+
+func isPathWordSeparator(r rune) bool {
+	return !unicode.IsLetter(r) && !unicode.IsDigit(r)
 }
 
 func leadingTokenHasWriteFragment(tokens []string) bool {
@@ -3223,6 +3419,7 @@ func (g *Generator) renderSingleFiles() error {
 		"deliver_download_test.go.tmpl":            filepath.Join("internal", "cli", "deliver_download_test.go"),
 		"feedback.go.tmpl":                         filepath.Join("internal", "cli", "feedback.go"),
 		"which.go.tmpl":                            filepath.Join("internal", "cli", "which.go"),
+		"local_data.go.tmpl":                       filepath.Join("internal", "cli", "local_data.go"),
 		"which_test.go.tmpl":                       filepath.Join("internal", "cli", "which_test.go"),
 		"config.go.tmpl":                           filepath.Join("internal", "config", "config.go"),
 		"cache.go.tmpl":                            filepath.Join("internal", "cache", "cache.go"),
@@ -3276,6 +3473,8 @@ func (g *Generator) renderSingleFiles() error {
 		"cliutil_odata_date_test.go.tmpl":          filepath.Join("internal", "cliutil", "odata_date_test.go"),
 		"cliutil_query.go.tmpl":                    filepath.Join("internal", "cliutil", "query.go"),
 		"cliutil_query_test.go.tmpl":               filepath.Join("internal", "cliutil", "query_test.go"),
+		"cliutil_envassign.go.tmpl":                filepath.Join("internal", "cliutil", "envassign.go"),
+		"cliutil_envassign_test.go.tmpl":           filepath.Join("internal", "cliutil", "envassign_test.go"),
 		"cliutil_test.go.tmpl":                     filepath.Join("internal", "cliutil", "cliutil_test.go"),
 		"mcp_bound.go.tmpl":                        filepath.Join("internal", "mcp", "bound", "bound.go"),
 		"mcp_bound_test.go.tmpl":                   filepath.Join("internal", "mcp", "bound", "bound_test.go"),
@@ -4035,6 +4234,7 @@ func (g *Generator) activeFrameworkCobraUseNames() map[string]struct{} {
 		"doctor":        {},
 		"feedback":      {},
 		"help":          {},
+		"local-data":    {},
 		"profile":       {},
 		"version":       {},
 		"which":         {},
@@ -4245,6 +4445,8 @@ func (g *Generator) GenerateMCPSurface() error {
 		"cliutil_jwtshape_test.go.tmpl":           filepath.Join("internal", "cliutil", "jwtshape_test.go"),
 		"cliutil_query.go.tmpl":                   filepath.Join("internal", "cliutil", "query.go"),
 		"cliutil_query_test.go.tmpl":              filepath.Join("internal", "cliutil", "query_test.go"),
+		"cliutil_envassign.go.tmpl":               filepath.Join("internal", "cliutil", "envassign.go"),
+		"cliutil_envassign_test.go.tmpl":          filepath.Join("internal", "cliutil", "envassign_test.go"),
 		"mcp_bound.go.tmpl":                       filepath.Join("internal", "mcp", "bound", "bound.go"),
 		"mcp_bound_test.go.tmpl":                  filepath.Join("internal", "mcp", "bound", "bound_test.go"),
 	}
@@ -9478,6 +9680,30 @@ func endpointUsesMultipart(endpoint spec.Endpoint) bool {
 
 func hasMultipartRequest(apiSpec *spec.APISpec) bool {
 	return anyEndpointMatches(apiSpec, endpointUsesMultipart)
+}
+
+// endpointHasMCPUpload reports whether the typed MCP tool for endpoint takes a
+// binary multipart file param. Such a tool previews the upload until the
+// caller passes confirm: true.
+func endpointHasMCPUpload(endpoint spec.Endpoint) bool {
+	return endpointUsesMultipart(endpoint) && slices.ContainsFunc(mcpToolInputParams(endpoint), isBinaryParam)
+}
+
+// mcpUploadConfirmArg names a typed upload tool's confirm argument: "confirm",
+// or "confirm_upload" (then "confirm_upload_upload", ...) when a tool input
+// (an API param or a global path template input) already uses that name, so
+// the gate never shadows another input. The generated handler derives the same
+// name from its bindings (mcpUploadConfirmName in mcp_tools.go.tmpl).
+func mcpUploadConfirmArg(endpoint spec.Endpoint, globalInputs []spec.Param) string {
+	taken := map[string]bool{}
+	for _, p := range append(mcpToolInputParams(endpoint), globalInputs...) {
+		taken[mcpInputName(p)] = true
+	}
+	name := "confirm"
+	for taken[name] {
+		name += "_upload"
+	}
+	return name
 }
 
 func endpointUsesForm(endpoint spec.Endpoint) bool {

@@ -2281,7 +2281,7 @@ type CacheCommand struct {
 type ShareConfig struct {
 	Enabled        bool     `yaml:"enabled,omitempty" json:"enabled,omitempty"`                 // master switch; when false, the share package and command are not emitted
 	SnapshotTables []string `yaml:"snapshot_tables,omitempty" json:"snapshot_tables,omitempty"` // explicit allowlist of SQLite tables included in the snapshot. Required when Enabled. Names matching denylisted patterns (*_cache, *_secrets, auth_*) are rejected at parse time.
-	DefaultRepo    string   `yaml:"default_repo,omitempty" json:"default_repo,omitempty"`       // optional default git remote (e.g., "git@github.com:acme/linear-snapshots.git"); command-line --repo flag always wins
+	DefaultRepo    string   `yaml:"default_repo,omitempty" json:"default_repo,omitempty"`       // optional git remote (e.g., "git@github.com:acme/linear-snapshots.git"); share publish and subscribe always use it and take no remote flag. Must be a URL or an absolute path; blank means local-only publish and no subscribe
 	DefaultBranch  string   `yaml:"default_branch,omitempty" json:"default_branch,omitempty"`   // optional default branch for push/pull; blank means "main"
 }
 
@@ -2570,6 +2570,12 @@ type Endpoint struct {
 	// marks a GET action as state-changing; false marks a POST (or other
 	// non-GET) endpoint as a read so generated commands print the body.
 	Mutation *bool `yaml:"mutation,omitempty" json:"mutation,omitempty"`
+	// Destructive is the optional MCP destructiveHint for a write that
+	// stays a write. nil means DELETE advertises destructive and every
+	// other write leaves the hint unset, so hosts treat it as possibly
+	// destructive. false marks an additive write without making the
+	// command read-only. Reads ignore this field.
+	Destructive *bool `yaml:"destructive,omitempty" json:"destructive,omitempty"`
 	// ReplaySafe is the optional explicit replay override for a mutating
 	// request. nil means unset (the generator treats file-upload endpoints
 	// as replay-safe and every other POST/PATCH as unsafe). true lets the
@@ -3917,6 +3923,7 @@ var ReservedCLIResourceNames = map[string]struct{}{
 	"helpers":          {},
 	"html_extract":     {},
 	"import":           {},
+	"local_data":       {},
 	"profile":          {},
 	"refresh_bearer":   {},
 	"root":             {},
@@ -3952,6 +3959,7 @@ var ReservedCobraUseNames = map[string]struct{}{
 	"jobs":           {},
 	"learnings":      {},
 	"live":           {},
+	"local-data":     {},
 	"login":          {},
 	"load":           {},
 	"orphans":        {},
@@ -5939,7 +5947,35 @@ func validateCacheShare(cache CacheConfig, share ShareConfig, resources map[stri
 		}
 		seen[t] = struct{}{}
 	}
+	if shareRepoIsRelativePath(strings.TrimSpace(share.DefaultRepo)) {
+		return fmt.Errorf("share.default_repo %q is a relative path; the share remote is fixed at generation time, so use a URL or an absolute path", share.DefaultRepo)
+	}
 	return nil
+}
+
+// shareRepoIsRelativePath reports whether git would read repo as a local path
+// that is not absolute. A relative path would resolve against each operator's
+// working directory, so it cannot pin the share remote. URLs ("scheme://"),
+// scp-style "host:path" remotes, and absolute Unix or Windows paths pass.
+func shareRepoIsRelativePath(repo string) bool {
+	if repo == "" || strings.Contains(repo, "://") {
+		return false
+	}
+	if strings.HasPrefix(repo, "/") || strings.HasPrefix(repo, `\\`) {
+		return false
+	}
+	if len(repo) >= 3 && repo[1] == ':' && (repo[2] == '/' || repo[2] == '\\') {
+		c := repo[0] | 0x20
+		if c >= 'a' && c <= 'z' {
+			return false // Windows drive path, e.g. C:\snapshots.git
+		}
+	}
+	if colon := strings.Index(repo, ":"); colon > 0 {
+		if slash := strings.Index(repo, "/"); slash < 0 || colon < slash {
+			return false // scp-style host:path
+		}
+	}
+	return true
 }
 
 // learnSeedKindRe enforces the seed kind naming rules described on

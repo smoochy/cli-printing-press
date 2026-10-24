@@ -406,6 +406,43 @@ func TestBlockedStructuredArgsOnlyDropsInheritedRootFlags(t *testing.T) {
 	}
 }
 
+// TestBlockedStructuredArgsDropsInheritedPacingFlags pins that an MCP caller
+// cannot turn off the client-side pacing that keeps the operator's API key
+// under vendor rate limits, or stretch the operator's request timeout. A
+// command's own local --timeout stays available.
+func TestBlockedStructuredArgsDropsInheritedPacingFlags(t *testing.T) {
+	root := &cobra.Command{Use: "root"}
+	root.PersistentFlags().Float64("rate-limit", 0, "max requests per second")
+	root.PersistentFlags().String("throttle-mode", "strict", "throttle mode")
+	root.PersistentFlags().Duration("timeout", time.Minute, "request timeout")
+
+	syncCmd := &cobra.Command{Use: "sync"}
+	root.AddCommand(syncCmd)
+	waitCmd := &cobra.Command{Use: "wait"}
+	waitCmd.Flags().Duration("timeout", 0, "how long to wait")
+	root.AddCommand(waitCmd)
+
+	blocked := blockedStructuredArgsForCommand(syncCmd)
+	for _, name := range []string{"rate-limit", "throttle-mode", "timeout"} {
+		if !blocked[name] {
+			t.Fatalf("inherited root --%s was not blocked: %#v", name, blocked)
+		}
+	}
+	got := cliArgsFromMCP(map[string]any{
+		"limit":         float64(5),
+		"rate-limit":    float64(0),
+		"throttle-mode": "off",
+		"timeout":       "24h",
+	}, blocked)
+	if want := []string{"--limit=5"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("cliArgsFromMCP pacing flags: got %v, want %v", got, want)
+	}
+
+	if blockedStructuredArgsForCommand(waitCmd)["timeout"] {
+		t.Fatal("command-local --timeout was blocked as a root flag")
+	}
+}
+
 func TestWriteSinkFlagsStayOutOfMCPSchemaAndArgv(t *testing.T) {
 	pinMCPReadOnlyOff(t)
 	root := &cobra.Command{Use: "root"}
@@ -2256,6 +2293,31 @@ func TestRunCLICommandSetsMCPChildEnv(t *testing.T) {
 	}
 }
 
+func TestRunCLICommandOmitsMCPHTTPToken(t *testing.T) {
+	const token = "mcp-http-token-should-not-leak-0123456789abcdef"
+	t.Setenv("PRINTING_PRESS_GOLDEN_MCP_HTTP_TOKEN", token)
+	t.Setenv(strings.ToLower("PRINTING_PRESS_GOLDEN_MCP_HTTP_TOKEN"), token+"-lower")
+	t.Setenv("PRINTING_PRESS_GOLDEN_MCP_HTTP_TOKEN_EXTRA", "keep-me")
+	bin := writeShelloutHelper(t, "print-env")
+	result, err := RunCLICommand(context.Background(), bin, nil)
+	if err != nil {
+		t.Fatalf("RunCLICommand: %v", err)
+	}
+	out := strings.ToLower(result.Stdout)
+	if strings.Contains(out, strings.ToLower(token)) {
+		t.Fatal("child inherited MCP HTTP token")
+	}
+	if strings.Contains(out, strings.ToLower("PRINTING_PRESS_GOLDEN_MCP_HTTP_TOKEN=")) {
+		t.Fatal("child inherited MCP HTTP token variable")
+	}
+	if !strings.Contains(out, strings.ToLower("PRINTING_PRESS_GOLDEN_MCP_HTTP_TOKEN_EXTRA=keep-me")) {
+		t.Fatal("child dropped an unrelated environment variable")
+	}
+	if !strings.Contains(result.Stdout, cliutil.MCPChildEnvVar+"=1") {
+		t.Fatal("child missing MCP child marker")
+	}
+}
+
 func TestRunCLICommandBoundsFailureOutput(t *testing.T) {
 	for _, mode := range []string{"fail-large-stderr", "fail-large-stdout"} {
 		t.Run(mode, func(t *testing.T) {
@@ -2544,11 +2606,11 @@ func TestMCPReadOnlySwitch(t *testing.T) {
 		if note.Tool.Annotations.ReadOnlyHint != nil && *note.Tool.Annotations.ReadOnlyHint {
 			t.Fatal("local-write tool became read-only")
 		}
-		if note.Tool.Annotations.DestructiveHint == nil || *note.Tool.Annotations.DestructiveHint {
-			t.Fatalf("note destructiveHint = %v", note.Tool.Annotations.DestructiveHint)
+		if note.Tool.Annotations.DestructiveHint == nil || !*note.Tool.Annotations.DestructiveHint {
+			t.Fatalf("note destructiveHint = %v, want possibly destructive", note.Tool.Annotations.DestructiveHint)
 		}
-		if note.Tool.Annotations.OpenWorldHint == nil || *note.Tool.Annotations.OpenWorldHint {
-			t.Fatalf("note openWorldHint = %v", note.Tool.Annotations.OpenWorldHint)
+		if note.Tool.Annotations.OpenWorldHint == nil || !*note.Tool.Annotations.OpenWorldHint {
+			t.Fatalf("note openWorldHint = %v, want true", note.Tool.Annotations.OpenWorldHint)
 		}
 
 		repair := tools["repair"]
@@ -2846,6 +2908,30 @@ func decodeArgvResult(t *testing.T, result *mcplib.CallToolResult) []string {
 		t.Fatalf("decode argv result: %v; text=%q", err, toolResultText(result))
 	}
 	return got
+}
+
+func TestMCPChildEnvironKeepsLearnSurface(t *testing.T) {
+	t.Setenv("PP_TEST_LEARN_SURFACE", "mcp")
+	t.Setenv(cliutil.MCPChildEnvVar, "stale")
+	env := mcpChildEnviron()
+	if !containsEnv(env, "PP_TEST_LEARN_SURFACE=mcp") {
+		t.Fatalf("child env dropped learn surface: %v", env)
+	}
+	if containsEnv(env, cliutil.MCPChildEnvVar+"=stale") {
+		t.Fatalf("child env kept the parent marker: %v", env)
+	}
+	if !containsEnv(env, cliutil.MCPChildEnvVar+"=1") {
+		t.Fatalf("child env missing fresh marker: %v", env)
+	}
+}
+
+func containsEnv(env []string, want string) bool {
+	for _, entry := range env {
+		if entry == want {
+			return true
+		}
+	}
+	return false
 }
 
 func toolResultText(result *mcplib.CallToolResult) string {

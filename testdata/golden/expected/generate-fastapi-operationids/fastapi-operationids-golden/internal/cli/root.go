@@ -381,6 +381,9 @@ Run 'fastapi-operationids-golden-pp-cli doctor' to verify connectivity.`,
 				cmd.SetOut(&mirrorWriter{primary: os.Stdout, copy: flags.deliverBuf})
 			}
 		}
+		if err := applyLocalDataEnv(cmd, flags); err != nil {
+			return err
+		}
 		// An incompatible --data-source has to fail before the platform
 		// identity probe. A failed probe would otherwise hide this error.
 		switch flags.dataSource {
@@ -445,6 +448,7 @@ Run 'fastapi-operationids-golden-pp-cli doctor' to verify connectivity.`,
 	}
 	rootCmd.AddCommand(newQuotesCmd(flags))
 	rootCmd.AddCommand(newDoctorCmd(flags))
+	rootCmd.AddCommand(newLocalDataCmd(flags))
 	if registeredPlatformSource != nil {
 		attachPlatformClientCommands(rootCmd, flags)
 	}
@@ -512,6 +516,7 @@ var learnHookSkipList = map[string]struct{}{
 	"agent-context": {},
 	"completion":    {},
 	"version":       {},
+	"local-data":    {},
 }
 
 // shouldSkipLearnHook reports whether a recall pre-run hook should
@@ -582,7 +587,7 @@ func journalInvocation(flags *rootFlags, rootCmd, executed *cobra.Command, err e
 	// The master --no-learn switch kills journaling too. On the
 	// parse-failure path the flag was never parsed into rootFlags, so
 	// the raw args are consulted as well.
-	if noLearnActive(flags) || argsDisableLearn(os.Args[1:]) {
+	if noLearnActive(flags) || argsDisableLearn(os.Args[1:]) || isLocalDataInvocation(rootCmd, executed) {
 		return
 	}
 	exitCode := 0
@@ -620,6 +625,13 @@ func journalInvocation(flags *rootFlags, rootCmd, executed *cobra.Command, err e
 		FailedFlag:    failedFlag,
 		SuggestedFlag: suggestedFlag,
 	})
+}
+
+// isLocalDataInvocation keeps the learn loop from journaling or deriving
+// after local-data purge, which would recreate the files it just erased.
+func isLocalDataInvocation(rootCmd, executed *cobra.Command) bool {
+	chain := journalVerbChain(rootCmd, executed)
+	return len(chain) > 0 && chain[0] == "local-data"
 }
 
 // journalVerbChain resolves the subcommand verb chain for the journal
@@ -707,7 +719,7 @@ var learnFamilyCommands = map[string]struct{}{
 // appended may wait out the peer still holding the offset lock so that
 // line is not left unpaired when the process exits.
 func deriveFlagCorrections(flags *rootFlags, rootCmd, executed *cobra.Command) {
-	if noLearnActive(flags) || argsDisableLearn(os.Args[1:]) || learn.JournalCaptureDisabled() {
+	if noLearnActive(flags) || argsDisableLearn(os.Args[1:]) || learn.JournalCaptureDisabled() || isLocalDataInvocation(rootCmd, executed) {
 		return
 	}
 	chain := journalVerbChain(rootCmd, executed)
@@ -749,6 +761,56 @@ func commandTreeHasFlag(cmd *cobra.Command, name string) bool {
 		}
 	}
 	return false
+}
+
+// noLocalDataEnvVar is the operator switch for running without a local copy
+// of API responses. It is an env var because MCP hosts cannot pass CLI flags;
+// every child CLI the MCP server spawns inherits it.
+const noLocalDataEnvVar = "FASTAPI_OPERATIONIDS_GOLDEN_NO_LOCAL_DATA"
+
+// dataSourceEnvVar supplies the --data-source default for hosts that cannot
+// pass CLI flags. An explicit flag or run profile still wins.
+const dataSourceEnvVar = "FASTAPI_OPERATIONIDS_GOLDEN_DATA_SOURCE"
+
+func localDataDisabled() bool {
+	return strings.TrimSpace(os.Getenv(noLocalDataEnvVar)) == "1"
+}
+
+// localDataWriterCommands are the generated commands whose job is to copy API
+// data into the local store, keyed by command path below the root.
+var localDataWriterCommands = map[string]bool{"sync": true, "workflow archive": true}
+
+// applyLocalDataEnv folds the local-data env switches into the parsed flags.
+// The disable switch outranks every flag so an agent-supplied argument cannot
+// undo the operator's choice. Reading a store that already exists saves
+// nothing new, so local reads stay available.
+func applyLocalDataEnv(cmd *cobra.Command, flags *rootFlags) error {
+	if localDataDisabled() {
+		flags.noCache = true
+		switch {
+		case cmd.Flags().Changed("data-source") && flags.dataSource == "auto":
+			return fmt.Errorf("--data-source auto conflicts with %s=1: auto saves live reads to the local store; use live or local", noLocalDataEnvVar)
+		case cmd.Flags().Changed("data-source"):
+		case commandDataSourceAnnotation(cmd) == "local":
+			flags.dataSource = "local"
+		default:
+			flags.dataSource = "live"
+		}
+		path := strings.Join(strings.Fields(cmd.CommandPath())[1:], " ")
+		if localDataWriterCommands[path] && !flags.dryRun {
+			return fmt.Errorf("%s is disabled while %s=1: it would save API data to the local store", path, noLocalDataEnvVar)
+		}
+		return nil
+	}
+	if value := strings.TrimSpace(os.Getenv(dataSourceEnvVar)); value != "" && !cmd.Flags().Changed("data-source") {
+		switch value {
+		case "auto", "live", "local":
+			flags.dataSource = value
+		default:
+			return fmt.Errorf("invalid %s value %q: must be auto, live, or local", dataSourceEnvVar, value)
+		}
+	}
+	return nil
 }
 
 // ApplyProfileToFlags uses FlagSet.Set, so a saved timeout is Changed and

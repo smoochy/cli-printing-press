@@ -86,6 +86,8 @@ func TestGenerateProjectsCompile(t *testing.T) {
 		"internal/cliutil/odata_date_test.go",
 		"internal/cliutil/query.go",
 		"internal/cliutil/query_test.go",
+		"internal/cliutil/envassign.go",
+		"internal/cliutil/envassign_test.go",
 		"internal/cliutil/cliutil_test.go",
 		"internal/client/client.go",
 		"internal/client/client_test.go",
@@ -178,9 +180,11 @@ func TestGenerateProjectsCompile(t *testing.T) {
 		// darwin_acl_test.go, darwin_acl_live_test.go). Always emitted:
 		// profile checks exist when auth is none.
 		// +1: cliutil/windows_account.go, the shared Windows SID helpers.
-		{name: "stytch", specPath: filepath.Join("..", "..", "testdata", "stytch.yaml"), expectedFiles: 193},
-		{name: "clerk", specPath: filepath.Join("..", "..", "testdata", "clerk.yaml"), expectedFiles: 197},
-		{name: "loops", specPath: filepath.Join("..", "..", "testdata", "loops.yaml"), expectedFiles: 194},
+		// +1: internal/cli/local_data.go, the always-emitted local-data purge.
+		// +2: cliutil.EnvAssignHint and its GOOS test.
+		{name: "stytch", specPath: filepath.Join("..", "..", "testdata", "stytch.yaml"), expectedFiles: 196},
+		{name: "clerk", specPath: filepath.Join("..", "..", "testdata", "clerk.yaml"), expectedFiles: 200},
+		{name: "loops", specPath: filepath.Join("..", "..", "testdata", "loops.yaml"), expectedFiles: 197},
 	}
 
 	for _, tt := range tests {
@@ -889,6 +893,113 @@ func TestGenerateShareEmittedWhenEnabled(t *testing.T) {
 	runGoCommand(t, outputDir, "mod", "tidy")
 	runGoCommand(t, outputDir, "build", "./...")
 	runGoCommand(t, outputDir, "test", "./internal/share/...")
+
+	// With no share.default_repo there is no remote: subscribe refuses and
+	// the caller cannot supply one.
+	binaryPath := filepath.Join(outputDir, naming.CLI(apiSpec.Name))
+	runGoCommand(t, outputDir, "build", "-o", binaryPath, "./cmd/"+naming.CLI(apiSpec.Name))
+	env := shareDecoyEnv(t)
+	out, err := runGeneratedCLI(t, binaryPath, env, "share", "subscribe", "--repo", filepath.Join(t.TempDir(), "sub"))
+	require.Error(t, err, out)
+	assert.Contains(t, out, "generated without share.default_repo")
+	out, err = runGeneratedCLI(t, binaryPath, env, "share", "subscribe", "--remote", "https://example.invalid/x.git")
+	require.Error(t, err, out)
+	assert.Contains(t, out, "unknown flag: --remote")
+}
+
+// TestGenerateSharePinsRemoteToDefaultRepo drives a share-enabled binary whose
+// spec names a default repo (a local bare repo here): publish and subscribe take
+// no --remote, publish pushes to the default repo, subscribe hydrates from it,
+// and a --repo checkout whose origin is any other remote is refused before git
+// fetches or pushes.
+func TestGenerateSharePinsRemoteToDefaultRepo(t *testing.T) {
+	t.Parallel()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found on PATH")
+	}
+
+	work := t.TempDir()
+	pinned := filepath.Join(work, "pinned.git")
+	gitInWork := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = work
+		out, err := cmd.CombinedOutput()
+		require.NoError(t, err, string(out))
+	}
+	gitInWork("init", "--bare", pinned)
+
+	apiSpec, err := spec.Parse(filepath.Join("..", "..", "testdata", "stytch.yaml"))
+	require.NoError(t, err)
+	apiSpec.Cache = spec.CacheConfig{Enabled: true, StaleAfter: "6h"}
+	apiSpec.Share = spec.ShareConfig{
+		Enabled:        true,
+		SnapshotTables: []string{"users", "sync_state"},
+		DefaultRepo:    pinned,
+	}
+
+	outputDir, binaryPath := buildGeneratedBinary(t, apiSpec)
+	shareSrc, err := os.ReadFile(filepath.Join(outputDir, "internal", "share", "share.go"))
+	require.NoError(t, err)
+	assert.Contains(t, string(shareSrc), fmt.Sprintf("const DefaultRemote = %q", pinned))
+	cmdSrc, err := os.ReadFile(filepath.Join(outputDir, "internal", "cli", "share_commands.go"))
+	require.NoError(t, err)
+	assert.NotContains(t, string(cmdSrc), `"remote", `, "share commands must not register a --remote flag")
+
+	env := shareDecoyEnv(t)
+	for _, sub := range []string{"publish", "subscribe"} {
+		out, err := runGeneratedCLI(t, binaryPath, env, "share", sub, "--remote", filepath.Join(work, "other.git"))
+		require.Error(t, err, out)
+		assert.Contains(t, out, "unknown flag: --remote", "share %s must not accept a caller-supplied remote", sub)
+	}
+
+	// A --repo checkout whose origin is some other remote is refused.
+	other := filepath.Join(work, "other.git")
+	gitInWork("init", "--bare", other)
+	foreign := filepath.Join(work, "foreign")
+	gitInWork("clone", "--", other, foreign)
+	out, err := runGeneratedCLI(t, binaryPath, env, "share", "publish", "--repo", foreign)
+	require.Error(t, err, out)
+	assert.Contains(t, out, "not the pinned remote")
+	refs := exec.Command("git", "--git-dir", other, "for-each-ref")
+	refsOut, err := refs.CombinedOutput()
+	require.NoError(t, err, string(refsOut))
+	assert.Empty(t, strings.TrimSpace(string(refsOut)), "nothing may be pushed to a remote other than the pinned one")
+
+	// publish clones the pinned default repo and pushes the snapshot to it.
+	out, err = runGeneratedCLI(t, binaryPath, env, "share", "publish", "--repo", filepath.Join(work, "pub"))
+	require.NoError(t, err, out)
+	assert.Contains(t, out, pinned)
+	manifest := exec.Command("git", "--git-dir", pinned, "show", "main:manifest.json")
+	manifestOut, err := manifest.CombinedOutput()
+	require.NoError(t, err, string(manifestOut))
+	assert.Contains(t, string(manifestOut), naming.CLI(apiSpec.Name))
+
+	// subscribe hydrates from the same pinned remote.
+	out, err = runGeneratedCLI(t, binaryPath, env, "share", "subscribe", "--repo", filepath.Join(work, "sub"))
+	require.NoError(t, err, out)
+	assert.Contains(t, out, pinned)
+}
+
+// shareDecoyEnv returns an environment whose home and XDG dirs point at a
+// fresh temp dir and whose git identity is fixed, so share commands run by a
+// generated binary never touch the real profile.
+func shareDecoyEnv(t *testing.T) []string {
+	t.Helper()
+	home := t.TempDir()
+	return append(os.Environ(),
+		"HOME="+home,
+		"USERPROFILE="+home,
+		"XDG_CONFIG_HOME="+filepath.Join(home, ".config"),
+		"XDG_DATA_HOME="+filepath.Join(home, ".local", "share"),
+		"XDG_STATE_HOME="+filepath.Join(home, ".local", "state"),
+		"XDG_CACHE_HOME="+filepath.Join(home, ".cache"),
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_AUTHOR_NAME=test",
+		"GIT_AUTHOR_EMAIL=test@example.invalid",
+		"GIT_COMMITTER_NAME=test",
+		"GIT_COMMITTER_EMAIL=test@example.invalid",
+	)
 }
 
 // TestGenerateShareSkippedWhenDisabled confirms share is not emitted for
@@ -2885,7 +2996,7 @@ func TestGenerate403HintsFollowAuthMode(t *testing.T) {
 				want: []string{
 					"Your credentials are valid but lack access",
 					"Check that your credentials have the required permissions and match the API's expected auth scheme.",
-					`Set your API key with: export MYAPI_TOKEN=\"your-token-here\"`,
+					`"Set your API key with: "+cliutil.EnvAssignHint(true, "MYAPI_TOKEN", "your-token-here")`,
 				},
 				reject: []string{"This API is configured without credentials"},
 			},
@@ -2893,7 +3004,7 @@ func TestGenerate403HintsFollowAuthMode(t *testing.T) {
 				want: []string{
 					"your credentials are valid but lack access",
 					"match the API's expected auth scheme",
-					`Set your API key with: export MYAPI_TOKEN=\"your-token-here\"`,
+					`"Set your API key with: " + cliutil.EnvAssignHint(true, "MYAPI_TOKEN", "your-token-here")`,
 				},
 				reject: []string{"this API is configured without credentials"},
 			},
@@ -12731,7 +12842,7 @@ func TestGeneratedAuthHints_DoNotDuplicateRecoveryCommands(t *testing.T) {
 		assert.Equal(t, 1, strings.Count(helpers401, "auth set-token"), helpers401)
 		assert.Contains(t, helpers401, `echo \"$TOKEN\" | bearerhints-pp-cli auth set-token`)
 		assert.NotContains(t, helpers401, "auth set-token <token>")
-		assert.Contains(t, helpers401, `or export BEARERHINTS_TOKEN=\"your-token-here\"`)
+		assert.Contains(t, helpers401, `cliutil.EnvAssignHint(true, "BEARERHINTS_TOKEN", "your-token-here")`)
 
 		tools := readGeneratedFile(t, outputDir, "internal", "mcp", "tools.go")
 		tools401 := generatedSourceBlock(t, tools, `case strings.Contains(msg, "HTTP 401"):`, `case strings.Contains(msg, "HTTP 403"):`)
@@ -12828,7 +12939,7 @@ func TestGeneratedAuthHints_BasicCredentialsAreSchemeAware(t *testing.T) {
 	helpersGo, err := os.ReadFile(filepath.Join(outputDir, "internal", "cli", "helpers.go"))
 	require.NoError(t, err)
 	helpers := string(helpersGo)
-	assert.Contains(t, helpers, `Set Basic credentials with: export BASICAUTH_USERNAME=\"your-username\" BASICAUTH_PASSWORD=\"your-password\"`)
+	assert.Contains(t, helpers, `"Set Basic credentials with: "+cliutil.EnvAssignHint(true, "BASICAUTH_USERNAME", "your-username", "BASICAUTH_PASSWORD", "your-password")`)
 	assert.Contains(t, helpers, "check your Basic credentials")
 	assert.NotContains(t, helpers, "hint: check your API key")
 	assert.NotContains(t, helpers, "Set your API key: export BASICAUTH_USERNAME=<your-key>")
@@ -12837,7 +12948,7 @@ func TestGeneratedAuthHints_BasicCredentialsAreSchemeAware(t *testing.T) {
 	mcpGo, err := os.ReadFile(filepath.Join(outputDir, "internal", "mcp", "tools.go"))
 	require.NoError(t, err)
 	mcp := string(mcpGo)
-	assert.Contains(t, mcp, `Set Basic credentials with: export BASICAUTH_USERNAME=\"your-username\" BASICAUTH_PASSWORD=\"your-password\"`)
+	assert.Contains(t, mcp, `"Set Basic credentials with: " + cliutil.EnvAssignHint(true, "BASICAUTH_USERNAME", "your-username", "BASICAUTH_PASSWORD", "your-password")`)
 	assert.Contains(t, mcp, "check your Basic credentials")
 	assert.NotContains(t, mcp, "hint: check your API key")
 	assert.NotContains(t, mcp, "Set your API key: export BASICAUTH_USERNAME=<your-key>")
@@ -12846,14 +12957,14 @@ func TestGeneratedAuthHints_BasicCredentialsAreSchemeAware(t *testing.T) {
 	doctorGo, err := os.ReadFile(filepath.Join(outputDir, "internal", "cli", "doctor.go"))
 	require.NoError(t, err)
 	doctor := string(doctorGo)
-	assert.Contains(t, doctor, `report["auth_hint"] = "Set Basic credentials with: export BASICAUTH_USERNAME=\"your-username\" BASICAUTH_PASSWORD=\"your-password\""`)
+	assert.Contains(t, doctor, `report["auth_hint"] = "Set Basic credentials with: " + cliutil.EnvAssignHint(true, "BASICAUTH_USERNAME", "your-username", "BASICAUTH_PASSWORD", "your-password")`)
 	assert.NotContains(t, doctor, `report["auth_hint"] = "export BASICAUTH_USERNAME=<your-key>"`)
 
 	authGo, err := os.ReadFile(filepath.Join(outputDir, "internal", "cli", "auth.go"))
 	require.NoError(t, err)
 	auth := string(authGo)
-	assert.Contains(t, auth, `export BASICAUTH_USERNAME=\"your-username\"`)
-	assert.Contains(t, auth, `export BASICAUTH_PASSWORD=\"your-password\"`)
+	assert.Contains(t, auth, `cliutil.EnvAssignHint(true, "BASICAUTH_USERNAME", "your-username")`)
+	assert.Contains(t, auth, `cliutil.EnvAssignHint(true, "BASICAUTH_PASSWORD", "your-password")`)
 	setupStart := strings.Index(auth, "func newAuthSetupCmd")
 	require.NotEqual(t, -1, setupStart)
 	setupEnd := strings.Index(auth[setupStart:], "func newAuthStatusCmd")
@@ -13120,7 +13231,7 @@ func TestGeneratedDoctor_AuthHintsWithKeyURL(t *testing.T) {
 	content := string(doctorGo)
 
 	// Should contain the env var hint
-	assert.Contains(t, content, `Set your API key with: export STEAM_API_KEY=\"your-token-here\"`)
+	assert.Contains(t, content, `"Set your API key with: " + cliutil.EnvAssignHint(true, "STEAM_API_KEY", "your-token-here")`)
 	// Should contain the key URL
 	assert.Contains(t, content, `https://steamcommunity.com/dev/apikey`)
 }
@@ -13162,7 +13273,7 @@ func TestGeneratedDoctor_AuthHintsWithoutKeyURL(t *testing.T) {
 	content := string(doctorGo)
 
 	// Should contain the env var hint
-	assert.Contains(t, content, `Set your API key with: export NOURL_API_KEY=\"your-token-here\"`)
+	assert.Contains(t, content, `"Set your API key with: " + cliutil.EnvAssignHint(true, "NOURL_API_KEY", "your-token-here")`)
 	// Should NOT contain any key URL line
 	assert.NotContains(t, content, "auth_key_url")
 }
@@ -18632,6 +18743,7 @@ import (
 	"testing"
 
 	cfgpkg "shopify-pp-cli/internal/config"
+	"shopify-pp-cli/internal/cliutil"
 )
 
 func TestBuildURLSubstitutes(t *testing.T) {
@@ -18650,18 +18762,30 @@ func TestBuildURLSubstitutes(t *testing.T) {
 }
 
 func TestBuildURLMissingShopReturnsActionableError(t *testing.T) {
+	orig := cliutil.EnvAssignHintGOOS
+	t.Cleanup(func() { cliutil.EnvAssignHintGOOS = orig })
 	vars := map[string]string{"api_version": "2026-04"}
-	_, err := buildURL("https://{shop}", "/admin/api/{api_version}/graphql.json", vars)
-	if err == nil {
-		t.Fatal("expected error when {shop} cannot be resolved")
+	check := func(goos, want string, rejectExport bool) {
+		t.Helper()
+		cliutil.EnvAssignHintGOOS = goos
+		_, err := buildURL("https://{shop}", "/admin/api/{api_version}/graphql.json", vars)
+		if err == nil {
+			t.Fatal("expected error when {shop} cannot be resolved")
+		}
+		msg := err.Error()
+		if !strings.Contains(msg, "SHOPIFY_SHOP not set") {
+			t.Errorf("%s error must name SHOPIFY_SHOP; got %q", goos, msg)
+		}
+		if !strings.Contains(msg, want) {
+			t.Errorf("%s error = %q, want %q", goos, msg, want)
+		}
+		if rejectExport && strings.Contains(msg, "export SHOPIFY_SHOP") {
+			t.Errorf("%s error included export: %q", goos, msg)
+		}
 	}
-	msg := err.Error()
-	if !strings.Contains(msg, "SHOPIFY_SHOP not set") {
-		t.Errorf("error must name SHOPIFY_SHOP; got %q", msg)
-	}
-	if !strings.Contains(msg, "export SHOPIFY_SHOP=") {
-		t.Errorf("error must include export hint; got %q", msg)
-	}
+	check("linux", "export SHOPIFY_SHOP=<value>", false)
+	check("darwin", "export SHOPIFY_SHOP=<value>", false)
+	check("windows", "$env:SHOPIFY_SHOP = \"<value>\"", true)
 }
 
 func TestBuildURLPassthroughWhenNoPlaceholders(t *testing.T) {
@@ -18793,7 +18917,7 @@ func TestGenerateInfersEndpointTemplateVarsFromBaseURL(t *testing.T) {
 // EndpointTemplateVars and the runtime env var (e.g. SHOPIFY_SHOP) is unset,
 // verify mode must seed Config.TemplateVars with a "<name>_placeholder" so
 // dry-run / validate-narrative / dogfood legs reach Cobra. Production
-// behavior — the actionable "export X=..." error from buildURL — must stay
+// behavior — the actionable unset-variable error from buildURL — must stay
 // unchanged when verify mode is off.
 func TestGenerateEndpointTemplateVarsVerifyPlaceholderFallback(t *testing.T) {
 	t.Parallel()

@@ -1,5 +1,24 @@
 # Changelog
 
+## [4.34.0](https://github.com/mvanhorn/cli-printing-press/compare/v4.33.10...v4.34.0) (2026-10-23)
+
+
+### Features
+
+* **cli:** add local-data purge to erase the store, response cache, and learn journal ([#5190](https://github.com/mvanhorn/cli-printing-press/issues/5190)) ([f8171c6](https://github.com/mvanhorn/cli-printing-press/commit/f8171c64a7e2c1e90533fd319c19ec40129f25b4))
+* **cli:** honor &lt;PREFIX&gt;_NO_LOCAL_DATA and &lt;PREFIX&gt;_DATA_SOURCE env switches ([#5192](https://github.com/mvanhorn/cli-printing-press/issues/5192)) ([fa367f4](https://github.com/mvanhorn/cli-printing-press/commit/fa367f45241f4662418e92e7c4e983552364c59a))
+
+
+### Bug Fixes
+
+* **cli:** block MCP callers from setting rate-limit, throttle-mode and timeout ([#5194](https://github.com/mvanhorn/cli-printing-press/issues/5194)) ([53b9542](https://github.com/mvanhorn/cli-printing-press/commit/53b95427cdf1473c5b8b3a436d1aaf1ee459f811)), closes [#5187](https://github.com/mvanhorn/cli-printing-press/issues/5187)
+* **cli:** classify GETs whose path names an action as writes ([#5195](https://github.com/mvanhorn/cli-printing-press/issues/5195)) ([f961064](https://github.com/mvanhorn/cli-printing-press/commit/f9610647157b8d74f74fe558a76c25aed6ebf199)), closes [#5183](https://github.com/mvanhorn/cli-printing-press/issues/5183)
+* **cli:** disclose local data and remote MCP settings in README, SKILL, and doctor ([#5196](https://github.com/mvanhorn/cli-printing-press/issues/5196)) ([b22c24b](https://github.com/mvanhorn/cli-printing-press/commit/b22c24bc2f209a90f37e0058b890810554257634))
+* **cli:** let generated OAuth login choose its scopes ([#5188](https://github.com/mvanhorn/cli-printing-press/issues/5188)) ([b032ee1](https://github.com/mvanhorn/cli-printing-press/commit/b032ee1e3a29ca3282aa7b70cb70973e8b787f92))
+* **cli:** MCP read-only switch drops every tool not annotated read-only ([#5191](https://github.com/mvanhorn/cli-printing-press/issues/5191)) ([0983519](https://github.com/mvanhorn/cli-printing-press/commit/09835190373eb9b1ffc64fc5483d3e90fa91906b)), closes [#5175](https://github.com/mvanhorn/cli-printing-press/issues/5175)
+* **cli:** sweep expired HTTP response cache entries ([#5189](https://github.com/mvanhorn/cli-printing-press/issues/5189)) ([1eb99ad](https://github.com/mvanhorn/cli-printing-press/commit/1eb99ad8bd0774a2ffa2db65ae8a8258af0b9424))
+* **cli:** tighten an existing store data directory to owner-only ([#5193](https://github.com/mvanhorn/cli-printing-press/issues/5193)) ([11f57dc](https://github.com/mvanhorn/cli-printing-press/commit/11f57dcedc4eba08b6c885d5306ac83ae4fc0b54)), closes [#5180](https://github.com/mvanhorn/cli-printing-press/issues/5180)
+
 ## [4.33.10](https://github.com/mvanhorn/cli-printing-press/compare/v4.33.9...v4.33.10) (2026-10-23)
 
 

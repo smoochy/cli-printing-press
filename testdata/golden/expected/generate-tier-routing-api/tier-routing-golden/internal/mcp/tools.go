@@ -109,6 +109,25 @@ func RegisterTools(s *server.MCPServer) {
 	// Runtime Cobra-tree mirror — exposes every user-facing command that is
 	// not already covered by a typed endpoint or framework MCP tool.
 	cobratree.RegisterAll(s, cli.RootCmd(), cobratree.SiblingCLIPath)
+
+	// The read-only switch covers every tool, so this runs after all
+	// registrations. Tools without readOnlyHint, including local-store
+	// writers, are removed.
+	if cliutil.IsMCPReadOnlyEnv() {
+		dropNonReadOnlyTools(s)
+	}
+}
+
+// dropNonReadOnlyTools removes every tool not annotated readOnlyHint=true.
+// A tool with no annotation fails closed.
+func dropNonReadOnlyTools(s *server.MCPServer) {
+	var drop []string
+	for name, entry := range s.ListTools() {
+		if hint := entry.Tool.Annotations.ReadOnlyHint; hint == nil || !*hint {
+			drop = append(drop, name)
+		}
+	}
+	s.DeleteTools(drop...)
 }
 
 type mcpParamBinding struct {
@@ -376,17 +395,17 @@ func makeAPIHandler(method, pathTemplate, tier string, readOnly bool, binaryResp
 			case strings.Contains(msg, "HTTP 400") && cliutil.LooksLikeAuthError(msg):
 				return mcpToolError("authentication error: " + cliutil.SanitizeErrorBody(msg) +
 					"\nhint: the API rejected the request — this usually means auth is missing or invalid." +
-					"\n      Set it with: echo \"$TOKEN\" | tier-routing-golden-pp-cli auth set-token or export TIER_GLOBAL_TOKEN=\"your-token-here\"" +
+					"\n      " + "Set it with: echo \"$TOKEN\" | tier-routing-golden-pp-cli auth set-token or " + cliutil.EnvAssignHint(true, "TIER_GLOBAL_TOKEN", "your-token-here") +
 					"\n      Run 'tier-routing-golden-pp-cli doctor' to check auth status."), nil
 			case strings.Contains(msg, "HTTP 401"):
 				return mcpToolError("authentication failed: " + cliutil.SanitizeErrorBody(msg) +
 					"\nhint: check your token." +
-					"\n      Set it with: echo \"$TOKEN\" | tier-routing-golden-pp-cli auth set-token or export TIER_GLOBAL_TOKEN=\"your-token-here\"" +
+					"\n      " + "Set it with: echo \"$TOKEN\" | tier-routing-golden-pp-cli auth set-token or " + cliutil.EnvAssignHint(true, "TIER_GLOBAL_TOKEN", "your-token-here") +
 					"\n      Run 'tier-routing-golden-pp-cli doctor' to check auth status."), nil
 			case strings.Contains(msg, "HTTP 403"):
 				return mcpToolError("permission denied: " + cliutil.SanitizeErrorBody(msg) +
 					"\nhint: your credentials are valid but lack access to this resource. Check that they have the required permissions and match the API's expected auth scheme." +
-					"\n      Set it with: echo \"$TOKEN\" | tier-routing-golden-pp-cli auth set-token or export TIER_GLOBAL_TOKEN=\"your-token-here\"" +
+					"\n      " + "Set it with: echo \"$TOKEN\" | tier-routing-golden-pp-cli auth set-token or " + cliutil.EnvAssignHint(true, "TIER_GLOBAL_TOKEN", "your-token-here") +
 					"\n      Run 'tier-routing-golden-pp-cli doctor' to check auth status."), nil
 			case strings.Contains(msg, "HTTP 404"):
 				if method == "DELETE" {

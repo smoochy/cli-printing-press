@@ -272,8 +272,10 @@ var confirmationBypassRootFlags = map[string]bool{
 // caller swap auth credentials, redirect the API base URL, select a different
 // per-client filesystem, relocate the config/data/state/cache roots, load a
 // malicious config file, change receipt destinations, change the delivery
-// target, redirect TLS trust, or skip a command's own confirmation prompt, all
-// of which sit outside the per-command surface the agent is supposed to be calling.
+// target, redirect TLS trust, skip a command's own confirmation prompt, turn
+// off the request pacing that keeps the operator's API key under the vendor's
+// rate limits, or stretch the operator's request timeout, all of which sit
+// outside the per-command surface the agent is supposed to be calling.
 var blockedRootFlags = map[string]bool{
 	"audit-dir":               true,
 	"base-url":                true,
@@ -285,7 +287,10 @@ var blockedRootFlags = map[string]bool{
 	"home":                    true,
 	"insecure":                true,
 	"profile":                 true,
+	"rate-limit":              true,
 	"receipt-file":            true,
+	"throttle-mode":           true,
+	"timeout":                 true,
 	"tls-server-name":         true,
 	"token":                   true,
 }
@@ -451,17 +456,31 @@ func RunCLICommand(ctx context.Context, binPath string, args []string) (CLIComma
 	return result, nil
 }
 
+// Mirrored CLI children do not authenticate the MCP listener. Copying this
+// bearer into every command environment only exposes it.
+const mcpHTTPTokenEnvVar = "PRINTING_PRESS_GOLDEN_MCP_HTTP_TOKEN"
+
 func mcpChildEnviron() []string {
-	prefix := cliutil.MCPChildEnvVar + "="
 	base := os.Environ()
 	env := make([]string, 0, len(base)+1)
 	for _, entry := range base {
-		if strings.HasPrefix(entry, prefix) {
+		if mcpChildEnvDropped(entry) {
 			continue
 		}
 		env = append(env, entry)
 	}
-	return append(env, prefix+"1")
+	return append(env, cliutil.MCPChildEnvVar+"=1")
+}
+
+func mcpChildEnvDropped(entry string) bool {
+	key, _, ok := strings.Cut(entry, "=")
+	if !ok {
+		return false
+	}
+	if key == cliutil.MCPChildEnvVar {
+		return true
+	}
+	return strings.EqualFold(key, mcpHTTPTokenEnvVar)
 }
 
 func cliFailureDetail(stdout, stderr string) string {
