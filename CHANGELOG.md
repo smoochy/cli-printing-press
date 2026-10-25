@@ -1,5 +1,21 @@
 # Changelog
 
+## [4.34.1](https://github.com/mvanhorn/cli-printing-press/compare/v4.34.0...v4.34.1) (2026-10-24)
+
+
+### Bug Fixes
+
+* **cli:** count novel hook registrations in scorecard and verify-skill ([#5208](https://github.com/mvanhorn/cli-printing-press/issues/5208)) ([beeda24](https://github.com/mvanhorn/cli-printing-press/commit/beeda247034daa535c808819e0dd8364a76844e2))
+* **cli:** keep a cleared sync checkpoint incomplete ([#5234](https://github.com/mvanhorn/cli-printing-press/issues/5234)) ([63f3423](https://github.com/mvanhorn/cli-printing-press/commit/63f34234c61f105c19c6d63a2b9e1a47ea00907c))
+* **cli:** pin the share remote to the spec's default repo ([#5221](https://github.com/mvanhorn/cli-printing-press/issues/5221)) ([1d92c85](https://github.com/mvanhorn/cli-printing-press/commit/1d92c8574d34b3d10e7fb6830e79494fa338812b))
+* **cli:** preview and confirm typed MCP multipart uploads ([#5222](https://github.com/mvanhorn/cli-printing-press/issues/5222)) ([91a22fe](https://github.com/mvanhorn/cli-printing-press/commit/91a22fe8437a11176c3253715486dad6546eb2b9))
+* **cli:** print Windows-usable environment assignment hints ([#5211](https://github.com/mvanhorn/cli-printing-press/issues/5211)) ([0930ee9](https://github.com/mvanhorn/cli-printing-press/commit/0930ee9470b94f0bbe46cbe63899d0f5f64724d2)), closes [#5152](https://github.com/mvanhorn/cli-printing-press/issues/5152)
+* **cli:** share roundtrip test seeds an allowlisted table ([#5233](https://github.com/mvanhorn/cli-printing-press/issues/5233)) ([0d2d7a5](https://github.com/mvanhorn/cli-printing-press/commit/0d2d7a51e4f1cf7feaacb637370ee1e47eb3d371)), closes [#5220](https://github.com/mvanhorn/cli-printing-press/issues/5220)
+* **cli:** skip live-dogfood help when examples are underivable ([#5232](https://github.com/mvanhorn/cli-printing-press/issues/5232)) ([456f405](https://github.com/mvanhorn/cli-printing-press/commit/456f405cd43f52f88a5bcfc4ce259ad4a8464f8c))
+* **cli:** skip unusable crowd-sniff base URL candidates and query scoped npm packages individually ([#5199](https://github.com/mvanhorn/cli-printing-press/issues/5199)) ([5e3ca12](https://github.com/mvanhorn/cli-printing-press/commit/5e3ca1209738fe90f2069acceb47434a9537c0aa))
+* **cli:** treat action POSTs as possibly destructive and quarantine MCP learn text ([#5209](https://github.com/mvanhorn/cli-printing-press/issues/5209)) ([7b6e627](https://github.com/mvanhorn/cli-printing-press/commit/7b6e627b5c6083731243f53b2efe68a3df26f65d))
+* **cli:** validate MCP HTTP origins, reject short tokens, and hide the token from child CLIs ([#5210](https://github.com/mvanhorn/cli-printing-press/issues/5210)) ([da6cb4c](https://github.com/mvanhorn/cli-printing-press/commit/da6cb4cb9d1e52acea440411a7f2adbe0c1f269b))
+
 ## [4.34.0](https://github.com/mvanhorn/cli-printing-press/compare/v4.33.10...v4.34.0) (2026-10-23)
 
 
