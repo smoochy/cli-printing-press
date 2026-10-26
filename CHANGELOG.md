@@ -1,5 +1,15 @@
 # Changelog
 
+## [4.34.2](https://github.com/mvanhorn/cli-printing-press/compare/v4.34.1...v4.34.2) (2026-10-25)
+
+
+### Bug Fixes
+
+* **cli:** honor --ignore-missing on promoted DELETE commands ([#5244](https://github.com/mvanhorn/cli-printing-press/issues/5244)) ([37ea813](https://github.com/mvanhorn/cli-printing-press/commit/37ea81388d4aed35f27052879e3aaf27e3c5ec6e))
+* **cli:** keep --dry-run from opening the store and cut backfillColumns schema probes ([#5246](https://github.com/mvanhorn/cli-printing-press/issues/5246)) ([9252c40](https://github.com/mvanhorn/cli-printing-press/commit/9252c40a5c859d22bd5d060c178c98c0f6c6d52e))
+* **cli:** stop MCP mirrors reporting help as success and resolve the companion CLI once ([#5243](https://github.com/mvanhorn/cli-printing-press/issues/5243)) ([b0859fd](https://github.com/mvanhorn/cli-printing-press/commit/b0859fd28e2c9dadc66e1d8f4daee78c9d5839ff)), closes [#5229](https://github.com/mvanhorn/cli-printing-press/issues/5229) [#5235](https://github.com/mvanhorn/cli-printing-press/issues/5235)
+* **cli:** stop resource-path check false CRITICALs on base_url overrides and local-store dumpers ([#5245](https://github.com/mvanhorn/cli-printing-press/issues/5245)) ([ae51da7](https://github.com/mvanhorn/cli-printing-press/commit/ae51da7e4aa9c0f9390abce0055f8b1ab8417e9c))
+
 ## [4.34.1](https://github.com/mvanhorn/cli-printing-press/compare/v4.34.0...v4.34.1) (2026-10-24)
 
 
