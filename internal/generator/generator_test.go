@@ -65,6 +65,8 @@ func TestGenerateProjectsCompile(t *testing.T) {
 		"internal/cli/platform_window_test.go",
 		"internal/cli/feedback.go",
 		"internal/cli/deliver_download_test.go",
+		"internal/cli/deliver_spacefast.go",
+		"internal/cli/deliver_spacefast_test.go",
 		"internal/cli/agent_context.go",
 		"internal/cli/root_test.go",
 		"internal/cli/sync_hint.go",
@@ -182,9 +184,11 @@ func TestGenerateProjectsCompile(t *testing.T) {
 		// +1: cliutil/windows_account.go, the shared Windows SID helpers.
 		// +1: internal/cli/local_data.go, the always-emitted local-data purge.
 		// +2: cliutil.EnvAssignHint and its GOOS test.
-		{name: "stytch", specPath: filepath.Join("..", "..", "testdata", "stytch.yaml"), expectedFiles: 196},
-		{name: "clerk", specPath: filepath.Join("..", "..", "testdata", "clerk.yaml"), expectedFiles: 200},
-		{name: "loops", specPath: filepath.Join("..", "..", "testdata", "loops.yaml"), expectedFiles: 197},
+		// +2: internal/cli/deliver_spacefast.go and its test, the always-emitted
+		// spacefast:<name> deliver sink.
+		{name: "stytch", specPath: filepath.Join("..", "..", "testdata", "stytch.yaml"), expectedFiles: 198},
+		{name: "clerk", specPath: filepath.Join("..", "..", "testdata", "clerk.yaml"), expectedFiles: 202},
+		{name: "loops", specPath: filepath.Join("..", "..", "testdata", "loops.yaml"), expectedFiles: 199},
 	}
 
 	for _, tt := range tests {
@@ -8181,11 +8185,13 @@ func TestGeneratedOutput_MutatingCommandsHaveEnvelope(t *testing.T) {
 	require.GreaterOrEqual(t, fallPrintErr, 0, "mutate fall-through must return printErr")
 	assert.Less(t, fallPartial, fallPrintErr, "partialFailure (exit 6) must precede printErr/selectErr on fall-through")
 
-	// Dry-run is flagged honestly in the envelope
+	// A completed dry run reports success and does not invent an HTTP status.
+	// verify_noop still forces success false; that assignment must not be the
+	// dry-run override.
 	assert.Contains(t, content, `flags.dryRun`)
-	assert.Contains(t, content, `envelope["dry_run"] = true`)
-	assert.Contains(t, content, `envelope["status"] = 0`)
-	assert.Contains(t, content, `envelope["success"] = false`)
+	assert.Contains(t, content, `markCompletedDryRun(envelope)`)
+	assert.NotContains(t, content, `envelope["status"] = 0`)
+	assert.NotContains(t, content, "envelope[\"dry_run\"] = true\n\t\t\t\t\tenvelope[\"status\"] = 0\n\t\t\t\t\tenvelope[\"success\"] = false")
 
 	requireGeneratedCompiles(t, outputDir)
 }
@@ -8875,7 +8881,7 @@ func TestRequiredFlagCommands_HelpFallbackOnEmptyInvocation(t *testing.T) {
 		require.GreaterOrEqual(t, guardIdx, 0,
 			"%s must guard empty invocation by returning cmd.Help() before required-flag checks", path)
 
-		requireIdx := strings.Index(body, `return fmt.Errorf("required flag \"%s\" not set",`)
+		requireIdx := strings.Index(body, `return dryRunValidationErr(cmd, flags, fmt.Errorf("required flag \"%s\" not set",`)
 		require.GreaterOrEqual(t, requireIdx, 0,
 			"%s must continue emitting required-flag validation", path)
 
